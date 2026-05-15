@@ -530,8 +530,8 @@ static void rx_callback(usb_transfer_t *xfer) {
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_rx_bytes += xfer->actual_num_bytes;
         s_rx_count++;
-        if (xfer->actual_num_bytes > 0)
-            log_append("RX[%d]: status=%d bytes=%d", s_rx_count, xfer->status, xfer->actual_num_bytes);
+        if (xfer->actual_num_bytes > 0 && (s_rx_count % 512 == 1))
+            log_append("RX[%d]: bytes=%d total=%d", s_rx_count, xfer->actual_num_bytes, s_rx_bytes);
 
         if (xfer->actual_num_bytes > (int)RNDIS_PACKET_HEADER_SIZE) {
             const rndis_packet_msg_t *hdr = (const rndis_packet_msg_t *)xfer->data_buffer;
@@ -791,6 +791,8 @@ static void rndis_setup_task(void *arg) {
         }
         start_rx();
         log_append("RX started, waiting for data...");
+        M5.Display.fillScreen(BLACK);
+        M5.Display.setCursor(0, 0);
 
         M5.Display.setTextColor(GREEN);
         M5.Display.println("RNDIS Ready!");
@@ -813,6 +815,7 @@ static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg) {
     } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
         log_append("USB Device disconnected");
         cleanup_rndis_device(true);
+        ESP.restart(); // 再接続はいろいろ安定しないのでソフトリセット
     }
 }
 
@@ -931,8 +934,10 @@ static void handle_http_client(WiFiClient client) {
         if (request.endsWith("\r\n\r\n")) break;
     }
 
-    // HTML レスポンス作成
-    String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>AtomS3 RNDIS Router</title>";
+    // HTML レスポンス作成（heap 断片化防止のため事前確保）
+    String html;
+    html.reserve(LOG_SIZE + 2048);
+    html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>AtomS3 RNDIS Router</title>";
     html += "<meta http-equiv='refresh' content='2'></head><body>";
     html += "<h1>AtomS3 RNDIS Router</h1>";
     html += "<h2>Status</h2>";
@@ -996,6 +1001,7 @@ void setup() {
     M5.Display.println("\nOK");
     s_local_ip = WiFi.localIP();
     s_wifi_connected = true;
+    IPAddress s_dns_ip = WiFi.dnsIP(); // Wi-Fi プライマリ DNS を取得
 
     // HTTP サーバー開始
     server.begin();
@@ -1018,9 +1024,13 @@ void setup() {
     esp_err_t ret = esp_netif_set_ip_info(s_usb_netif, &s_usb_ip);
     log_append("esp_netif: set_ip_info ret=%d (IP=192.168.4.1)", ret);
 
-    // DHCP で DNS サーバー (8.8.8.8) を通知
-    uint8_t dns_ip[4] = {8, 8, 8, 8};
-    esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, dns_ip, sizeof(dns_ip));
+    // DHCP で DNS サーバー (Wi-Fi プライマリ DNS) を通知
+    // esp_netif_set_dns_info は ETH+DHCP_SERVER モードで DHCP オファーに DNS を含める
+    log_append("DHCP DNS: %d.%d.%d.%d", s_dns_ip[0], s_dns_ip[1], s_dns_ip[2], s_dns_ip[3]);
+    esp_netif_dns_info_t dns_info = {};
+    IP4_ADDR(&dns_info.ip.u_addr.ip4, s_dns_ip[0], s_dns_ip[1], s_dns_ip[2], s_dns_ip[3]);
+    dns_info.ip.type = ESP_IPADDR_TYPE_V4;
+    esp_netif_set_dns_info(s_usb_netif, ESP_NETIF_DNS_MAIN, &dns_info);
 
     ret = esp_netif_dhcps_start(s_usb_netif);
     log_append("esp_netif: dhcps_start ret=%d", ret);
