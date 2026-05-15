@@ -119,7 +119,7 @@ static void log_append(const char *fmt, ...) {
     va_start(args, fmt);
     s_log_pos += vsnprintf(s_log_buffer + s_log_pos, LOG_SIZE - s_log_pos, fmt, args);
     va_end(args);
-    s_log_pos += snprintf(s_log_buffer + s_log_pos, LOG_SIZE - s_log_pos, "\n");
+    s_log_pos += snprintf(s_log_buffer + s_log_pos, LOG_SIZE - s_log_pos, "<br>\n");
 }
 
 static usb_host_client_handle_t s_client_hdl = NULL;
@@ -136,6 +136,12 @@ static uint32_t s_req_id       = 1;
 
 static esp_netif_t *s_usb_netif = nullptr;
 static esp_netif_ip_info_t s_usb_ip;
+
+// lwIP タスクコンテキストで NAPT を有効化するコールバック
+static esp_err_t enable_napt_cb(void *) {
+    ip_napt_enable(s_usb_ip.ip.addr, 1);
+    return ESP_OK;
+}
 
 typedef enum {
     RNDIS_STATE_IDLE,
@@ -156,13 +162,8 @@ static usb_transfer_t *s_tx_xfer = NULL;
 // Interrupt IN 転送バッファ（RNDIS 状態通知）
 static usb_transfer_t *s_intr_xfer = NULL;
 static uint8_t s_ep_intr = 0;  // Interrupt IN エンドポイント
-typedef struct {
-    uint8_t addr;
-    uint32_t epoch;
-} usb_dev_evt_t;
-// デバイス接続通知キュー（接続世代付きイベントを callback → setup task に渡す）
+// デバイス接続通知キュー（アドレスを event callback → setup task に渡す）
 static QueueHandle_t s_dev_queue = NULL;
-static volatile uint32_t s_dev_epoch = 0;
 
 // ─── コントロール転送ヘルパー ─────────────────────────────────────────────────
 
@@ -626,34 +627,13 @@ static void start_rx(void) {
 
 // 切断時/初期化失敗時の後始末を一元化して再接続を安定させる
 static void cleanup_rndis_device(bool from_disconnect) {
-    if (s_dev_hdl) {
-        if (s_ep_in) {
-            usb_host_endpoint_halt(s_dev_hdl, s_ep_in);
-            usb_host_endpoint_flush(s_dev_hdl, s_ep_in);
-        }
-        if (s_ep_intr) {
-            usb_host_endpoint_halt(s_dev_hdl, s_ep_intr);
-            usb_host_endpoint_flush(s_dev_hdl, s_ep_intr);
-        }
-        if (s_ep_out) {
-            usb_host_endpoint_halt(s_dev_hdl, s_ep_out);
-            usb_host_endpoint_flush(s_dev_hdl, s_ep_out);
-            usb_host_endpoint_clear(s_dev_hdl, s_ep_out);
-        }
-    }
+    // 切断時にコールバック再投入を止める
+    s_rndis_state = RNDIS_STATE_IDLE;
 
-    // 受信系転送を先に解放し、コールバック再投入を止める
-    if (s_rx_xfer) {
-        usb_host_transfer_free(s_rx_xfer);
-        s_rx_xfer = NULL;
-    }
-    if (s_intr_xfer) {
-        usb_host_transfer_free(s_intr_xfer);
-        s_intr_xfer = NULL;
-    }
-    if (s_tx_xfer) {
-        usb_host_transfer_free(s_tx_xfer);
-        s_tx_xfer = NULL;
+    // 送信セマフォが取りっぱなしだと再接続後に TX が永久 busy になるため、必ず解放可能状態へ戻す
+    if (s_tx_sem) {
+        xSemaphoreTake(s_tx_sem, 0);
+        xSemaphoreGive(s_tx_sem);
     }
 
     if (s_usb_netif) {
@@ -664,6 +644,19 @@ static void cleanup_rndis_device(bool from_disconnect) {
 
     // まだハンドルが有効ならインターフェース解放とクローズを試行
     if (s_dev_hdl) {
+        if (s_ep_in) {
+            usb_host_endpoint_halt(s_dev_hdl, s_ep_in);
+            usb_host_endpoint_flush(s_dev_hdl, s_ep_in);
+        }
+        if (s_ep_out) {
+            usb_host_endpoint_halt(s_dev_hdl, s_ep_out);
+            usb_host_endpoint_flush(s_dev_hdl, s_ep_out);
+        }
+        if (s_ep_intr) {
+            usb_host_endpoint_halt(s_dev_hdl, s_ep_intr);
+            usb_host_endpoint_flush(s_dev_hdl, s_ep_intr);
+        }
+
         if (s_comm_itf_num != 0xFF) {
             esp_err_t r = usb_host_interface_release(s_client_hdl, s_dev_hdl, s_comm_itf_num);
             log_append("Release COMM(if=%d): ret=%d", s_comm_itf_num, r);
@@ -677,10 +670,6 @@ static void cleanup_rndis_device(bool from_disconnect) {
         s_dev_hdl = NULL;
     }
 
-    // 切断時にTX完了通知が失われても、次回接続で送信が詰まらないよう再初期化
-    xSemaphoreTake(s_tx_sem, 0);
-    xSemaphoreGive(s_tx_sem);
-
     s_comm_itf_num = 0xFF;
     s_data_itf_num = 0xFF;
     s_comm_itf_alt = 0;
@@ -690,44 +679,32 @@ static void cleanup_rndis_device(bool from_disconnect) {
     s_ep_out = 0;
     s_ep_in_mps = 0;
     s_ep_out_mps = 0;
-    s_rndis_state = RNDIS_STATE_IDLE;
+
+    // 転送オブジェクト自体は保持して再接続時に再利用する（in-flight free 競合回避）
+    if (s_rx_xfer) {
+        s_rx_xfer->device_handle = NULL;
+        s_rx_xfer->bEndpointAddress = 0;
+    }
+    if (s_intr_xfer) {
+        s_intr_xfer->device_handle = NULL;
+        s_intr_xfer->bEndpointAddress = 0;
+    }
 
     if (from_disconnect) {
         M5.Display.println("Dev gone");
     }
 }
 
-static void restart_usb_dhcp_server(void) {
-    if (!s_usb_netif) return;
-    esp_err_t ret = esp_netif_dhcps_stop(s_usb_netif);
-    log_append("esp_netif: dhcps_stop ret=%d", ret);
-    ret = esp_netif_set_ip_info(s_usb_netif, &s_usb_ip);
-    log_append("esp_netif: set_ip_info ret=%d (IP=192.168.4.1)", ret);
-    ret = esp_netif_dhcps_start(s_usb_netif);
-    log_append("esp_netif: dhcps_start ret=%d", ret);
-}
-
 // ─── RNDIS セットアップタスク（event callback とは別タスクで実行） ────────────
 
 static void rndis_setup_task(void *arg) {
-    usb_dev_evt_t dev_evt;
+    uint8_t dev_addr;
     for (;;) {
-        if (xQueueReceive(s_dev_queue, &dev_evt, portMAX_DELAY) != pdTRUE) continue;
-        if (dev_evt.epoch != s_dev_epoch) {
-            log_append("Skip stale NEW_DEV event: evt_epoch=%u cur_epoch=%u", dev_evt.epoch, s_dev_epoch);
-            continue;
-        }
-        uint8_t dev_addr = dev_evt.addr;
-        uint32_t setup_epoch = dev_evt.epoch;
+        if (xQueueReceive(s_dev_queue, &dev_addr, portMAX_DELAY) != pdTRUE) continue;
 
         // デバイスオープン
         if (usb_host_device_open(s_client_hdl, dev_addr, &s_dev_hdl) != ESP_OK) {
             M5.Display.println("Open fail");
-            cleanup_rndis_device(false);
-            continue;
-        }
-        if (setup_epoch != s_dev_epoch) {
-            log_append("Setup aborted after open: stale epoch %u->%u", setup_epoch, s_dev_epoch);
             cleanup_rndis_device(false);
             continue;
         }
@@ -740,11 +717,6 @@ static void rndis_setup_task(void *arg) {
         s_ep_in = 0; s_ep_out = 0;
         if (!parse_config_desc()) {
             M5.Display.println("Desc fail");
-            cleanup_rndis_device(false);
-            continue;
-        }
-        if (setup_epoch != s_dev_epoch) {
-            log_append("Setup aborted after desc: stale epoch %u->%u", setup_epoch, s_dev_epoch);
             cleanup_rndis_device(false);
             continue;
         }
@@ -762,11 +734,6 @@ static void rndis_setup_task(void *arg) {
             cleanup_rndis_device(false);
             continue;
         }
-        if (setup_epoch != s_dev_epoch) {
-            log_append("Setup aborted after claim: stale epoch %u->%u", setup_epoch, s_dev_epoch);
-            cleanup_rndis_device(false);
-            continue;
-        }
 
         s_rndis_state = RNDIS_STATE_CONNECTED;
         M5.Display.println("Itf claimed");
@@ -777,11 +744,6 @@ static void rndis_setup_task(void *arg) {
             M5.Display.println("RNDIS INIT fail");
             M5.Display.setTextColor(WHITE);
             s_rndis_state = RNDIS_STATE_ERROR;
-            cleanup_rndis_device(false);
-            continue;
-        }
-        if (setup_epoch != s_dev_epoch) {
-            log_append("Setup aborted after init: stale epoch %u->%u", setup_epoch, s_dev_epoch);
             cleanup_rndis_device(false);
             continue;
         }
@@ -803,37 +765,12 @@ static void rndis_setup_task(void *arg) {
             cleanup_rndis_device(false);
             continue;
         }
-        if (setup_epoch != s_dev_epoch) {
-            log_append("Setup aborted after filter: stale epoch %u->%u", setup_epoch, s_dev_epoch);
-            cleanup_rndis_device(false);
-            continue;
-        }
 
         // デバイスが完全に初期化されるまで大幅に待機（Windows CE RNDIS ドライバ初期化時間）
         log_append("Setting up TX/RX/INTR transfers");
         vTaskDelay(pdMS_TO_TICKS(2000));
-        if (setup_epoch != s_dev_epoch) {
-            log_append("Setup aborted after delay: stale epoch %u->%u", setup_epoch, s_dev_epoch);
-            cleanup_rndis_device(false);
-            continue;
-        }
 
         // TX バッファ設定
-        if (s_tx_xfer == NULL) {
-            esp_err_t tx_alloc = usb_host_transfer_alloc(BULK_BUF_SIZE, 0, &s_tx_xfer);
-            log_append("TX alloc: ret=%d ptr=%p", tx_alloc, s_tx_xfer);
-            if (tx_alloc != ESP_OK || s_tx_xfer == NULL) {
-                M5.Display.setTextColor(RED);
-                M5.Display.println("TX alloc fail");
-                M5.Display.setTextColor(WHITE);
-                s_rndis_state = RNDIS_STATE_ERROR;
-                cleanup_rndis_device(false);
-                continue;
-            }
-            s_tx_xfer->callback   = tx_callback;
-            s_tx_xfer->context    = nullptr;
-            s_tx_xfer->timeout_ms = 2000;
-        }
         s_tx_xfer->device_handle    = s_dev_hdl;
         s_tx_xfer->bEndpointAddress = s_ep_out;
         log_append("TX buffer configured: ep=0x%02X", s_ep_out);
@@ -848,9 +785,9 @@ static void rndis_setup_task(void *arg) {
         s_rndis_state = RNDIS_STATE_READY;
         if (s_usb_netif) {
             esp_netif_action_start(s_usb_netif, nullptr, 0, nullptr);
-            restart_usb_dhcp_server();
             esp_netif_action_connected(s_usb_netif, nullptr, 0, nullptr);
-            log_append("esp_netif: action_start + action_connected + dhcps_restart");
+            esp_netif_tcpip_exec(enable_napt_cb, nullptr); // lwIPタスクで NAPT 有効化
+            log_append("esp_netif: action_start + action_connected, NAPT enabled");
         }
         start_rx();
         log_append("RX started, waiting for data...");
@@ -868,18 +805,13 @@ static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg) {
         M5.Display.println("Dev connected");
         log_append("USB Device connected");
         // ブロッキング処理は rndis_setup_task に委譲する
-        usb_dev_evt_t evt = {};
-        evt.addr = msg->new_dev.address;
-        uint32_t next_epoch = s_dev_epoch + 1;
-        s_dev_epoch = next_epoch;
-        evt.epoch = next_epoch;
-        xQueueSend(s_dev_queue, &evt, 0);
-        log_append("Queue NEW_DEV: addr=%u epoch=%u", evt.addr, evt.epoch);
+        uint8_t addr = msg->new_dev.address;
+        xQueueReset(s_dev_queue);
+        if (xQueueSend(s_dev_queue, &addr, 0) != pdTRUE) {
+            log_append("WARN: dev queue send failed");
+        }
     } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE) {
         log_append("USB Device disconnected");
-        s_dev_epoch = s_dev_epoch + 1;
-        xQueueReset(s_dev_queue);
-        log_append("DEV_GONE: epoch now %u, queue reset", s_dev_epoch);
         cleanup_rndis_device(true);
     }
 }
@@ -999,26 +931,9 @@ static void handle_http_client(WiFiClient client) {
         if (request.endsWith("\r\n\r\n")) break;
     }
 
-    int line_end = request.indexOf("\r\n");
-    String first_line = (line_end >= 0) ? request.substring(0, line_end) : request;
-
-    if (first_line.startsWith("GET /log")) {
-        String body = String(s_log_buffer);
-        client.println("HTTP/1.1 200 OK");
-        client.println("Content-Type: text/plain; charset=UTF-8");
-        client.println("Cache-Control: no-store, no-cache, must-revalidate");
-        client.println("Pragma: no-cache");
-        client.println("Content-Length: " + String(body.length()));
-        client.println("Connection: close");
-        client.println();
-        client.print(body);
-        client.stop();
-        return;
-    }
-
     // HTML レスポンス作成
     String html = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>AtomS3 RNDIS Router</title>";
-    html += "</head><body>";
+    html += "<meta http-equiv='refresh' content='2'></head><body>";
     html += "<h1>AtomS3 RNDIS Router</h1>";
     html += "<h2>Status</h2>";
     html += "<p>Local IP: " + s_local_ip.toString() + "</p>";
@@ -1036,18 +951,6 @@ static void handle_http_client(WiFiClient client) {
     html += s_log_buffer;
     html += "</textarea>";
     html += "<script>";
-    html += "function refreshLog(){";
-    html += "var box=document.getElementById('logBox');";
-    html += "if(!box)return;";
-    html += "fetch('/log?t='+Date.now(),{cache:'no-store'})";
-    html += ".then(function(r){return r.text();})";
-    html += ".then(function(t){";
-    html += "var stickBottom=(box.scrollTop+box.clientHeight+16)>=box.scrollHeight;";
-    html += "box.value=t;";
-    html += "if(stickBottom){box.scrollTop=box.scrollHeight;}";
-    html += "})";
-    html += ".catch(function(){});";
-    html += "}";
     html += "function copyLog(){";
     html += "var box=document.getElementById('logBox');";
     html += "var status=document.getElementById('copyStatus');";
@@ -1064,8 +967,6 @@ static void handle_http_client(WiFiClient client) {
     html += "try{document.execCommand('copy');status.textContent='コピーしました';}";
     html += "catch(e){status.textContent='コピー失敗: 手動コピーしてください';}";
     html += "}";
-    html += "setInterval(refreshLog,1000);";
-    html += "refreshLog();";
     html += "</script>";
     html += "</body></html>";
 
@@ -1117,6 +1018,10 @@ void setup() {
     esp_err_t ret = esp_netif_set_ip_info(s_usb_netif, &s_usb_ip);
     log_append("esp_netif: set_ip_info ret=%d (IP=192.168.4.1)", ret);
 
+    // DHCP で DNS サーバー (8.8.8.8) を通知
+    uint8_t dns_ip[4] = {8, 8, 8, 8};
+    esp_netif_dhcps_option(s_usb_netif, ESP_NETIF_OP_SET, ESP_NETIF_DOMAIN_NAME_SERVER, dns_ip, sizeof(dns_ip));
+
     ret = esp_netif_dhcps_start(s_usb_netif);
     log_append("esp_netif: dhcps_start ret=%d", ret);
 
@@ -1128,14 +1033,11 @@ void setup() {
         log_append("ERROR: DHCP server failed to start!");
     }
 
-    // 3. NAPT
-    ip_napt_enable(s_usb_ip.ip.addr, 1);
-
-    // 4. セマフォ・キュー初期化
+    // 3. セマフォ・キュー初期化
     s_ctrl_sem = xSemaphoreCreateBinary();
     s_tx_sem   = xSemaphoreCreateBinary();
     xSemaphoreGive(s_tx_sem);
-    s_dev_queue = xQueueCreate(2, sizeof(usb_dev_evt_t));
+    s_dev_queue = xQueueCreate(2, sizeof(uint8_t));
 
     // 5. TX 転送バッファ（デバイス接続前に確保しておく）
     usb_host_transfer_alloc(BULK_BUF_SIZE, 0, &s_tx_xfer);
