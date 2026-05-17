@@ -107,6 +107,7 @@ typedef struct {
 static WiFiServer server(80);
 static IPAddress s_local_ip;
 static bool s_wifi_connected = false;
+static bool s_http_rndis_only = true;
 
 // ログバッファ
 #define LOG_SIZE 8192
@@ -903,10 +904,11 @@ static esp_err_t usb_driver_post_attach(esp_netif_t *netif, void *args) {
 }
 
 // ─── USB 側 esp-netif ─────────────────────────────────────────────────────────
-
+// WiFi側とIPアドレス体系が被るとうまく通信できない気がするので
+// 必要であれば編集が必要です
 static esp_netif_t *create_usb_netif(void) {
-    IP4_ADDR(&s_usb_ip.ip,      192, 168, 4, 1);
-    IP4_ADDR(&s_usb_ip.gw,      192, 168, 4, 1);
+    IP4_ADDR(&s_usb_ip.ip,      192, 168, 37, 1);
+    IP4_ADDR(&s_usb_ip.gw,      192, 168, 37, 1);
     IP4_ADDR(&s_usb_ip.netmask, 255, 255, 255, 0);
 
     esp_netif_inherent_config_t base = ESP_NETIF_INHERENT_DEFAULT_ETH();
@@ -926,7 +928,37 @@ static esp_netif_t *create_usb_netif(void) {
 
 // ─── HTTP サーバー ────────────────────────────────────────────────────────────
 
+static bool is_allowed_http_client(const IPAddress &remote_ip) {
+    if (!s_http_rndis_only) return true;
+
+    IPAddress netif_ip((uint32_t)s_usb_ip.ip.addr);
+    IPAddress netmask((uint32_t)s_usb_ip.netmask.addr);
+
+    uint32_t remote = (uint32_t)remote_ip;
+    uint32_t base = (uint32_t)netif_ip;
+    uint32_t mask = (uint32_t)netmask;
+    return (remote & mask) == (base & mask);
+}
+
+static void send_http_forbidden(WiFiClient &client) {
+    const char *body = "<!DOCTYPE html><html><head><meta charset='UTF-8'><title>403 Forbidden</title></head><body><h1>403 Forbidden</h1><p>RNDIS側からのみアクセス可能です。</p></body></html>";
+    client.println("HTTP/1.1 403 Forbidden");
+    client.println("Content-Type: text/html; charset=UTF-8");
+    client.println(String("Content-Length: ") + strlen(body));
+    client.println("Connection: close");
+    client.println();
+    client.print(body);
+}
+
 static void handle_http_client(WiFiClient client) {
+    IPAddress remote_ip = client.remoteIP();
+    if (!is_allowed_http_client(remote_ip)) {
+        log_append("HTTP reject: remote=%s", remote_ip.toString().c_str());
+        send_http_forbidden(client);
+        client.stop();
+        return;
+    }
+
     String request = "";
     while (client.connected() && client.available()) {
         char c = client.read();
@@ -1005,10 +1037,12 @@ void setup() {
 
     // HTTP サーバー開始
     server.begin();
-    M5.Display.printf("HTTP: http://%s/\n", s_local_ip.toString().c_str());
+    M5.Display.println("HTTP server started");
+    log_append("HTTP server: mode=%s", s_http_rndis_only ? "RNDIS only" : "all interfaces");
 
     // 2. esp-netif (DHCP サーバ, 192.168.4.1)
     s_usb_netif = create_usb_netif();
+    M5.Display.printf("HTTP: http://192.168.4.1/\n");
     static UsbDriver drv;
     drv.base.post_attach = usb_driver_post_attach;
     drv.base.netif       = nullptr;
