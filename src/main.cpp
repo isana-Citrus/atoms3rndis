@@ -4,7 +4,7 @@
  * AtomS3 が USB ホストとして動作し、接続した RNDIS デバイス（brainnet 等）に
  * DHCP で IP を配布しつつ、WiFi 経由でインターネットに接続させる。
  *
- * LAN : USB RNDIS  – 192.168.4.1  (DHCP サーバ)
+ * LAN : USB RNDIS  – 192.168.37.1  (DHCP サーバ)
  * WAN : WiFi STA   – DHCP で動的 IP 取得
  * NAT : ip_napt_enable で LAN→WAN を NAT
  *
@@ -98,12 +98,51 @@ typedef struct {
     uint32_t VcHandle, Reserved;
 } rndis_packet_msg_t;
 
+typedef struct {
+    uint16_t wLength;
+    uint16_t bmNtbFormatsSupported;
+    uint32_t dwNtbInMaxSize;
+    uint16_t wNdpInDivisor;
+    uint16_t wNdpInPayloadRemainder;
+    uint16_t wNdpInAlignment;
+    uint16_t reserved0;
+    uint32_t dwNtbOutMaxSize;
+    uint16_t wNdpOutDivisor;
+    uint16_t wNdpOutPayloadRemainder;
+    uint16_t wNdpOutAlignment;
+    uint16_t reserved1;
+} cdc_ncm_ntb_parameters_t;
+
+typedef struct {
+    uint32_t dwSignature;
+    uint16_t wHeaderLength;
+    uint16_t wSequence;
+    uint16_t wBlockLength;
+    uint16_t wNdpIndex;
+} cdc_ncm_nth16_t;
+
+typedef struct {
+    uint32_t dwSignature;
+    uint16_t wLength;
+    uint16_t wNextNdpIndex;
+} cdc_ncm_ndp16_t;
+
+typedef struct {
+    uint16_t wDatagramIndex;
+    uint16_t wDatagramLength;
+} cdc_ncm_dpe16_t;
+
 #pragma pack(pop)
 
 // DataOffset=36 → ヘッダ先頭から 44 バイト後にデータ (8 + 36)
 #define RNDIS_PACKET_HEADER_SIZE  44u
 #define RNDIS_DATA_OFFSET         36u
 #define BULK_BUF_SIZE             2048u
+#define CDC_NCM_GET_NTB_PARAMETERS 0x80u
+#define CDC_NCM_SET_NTB_FORMAT     0x84u
+#define CDC_NCM_SET_NTB_INPUT_SIZE 0x86u
+#define CDC_NCM_NTH16_SIGNATURE    0x484D434Eu
+#define CDC_NCM_NDP16_SIGNATURE    0x304D434Eu
 
 // ─── グローバル状態 ───────────────────────────────────────────────────────────
 
@@ -116,6 +155,10 @@ static volatile uint32_t s_dns_query_count = 0;
 static volatile uint32_t s_dns_reply_count = 0;
 static volatile uint32_t s_dns_timeout_count = 0;
 static bool s_dns_task_started = false;
+static usb_transfer_status_t s_last_ctrl_status = USB_TRANSFER_STATUS_COMPLETED;
+static uint8_t s_ctrl_out_bm_request_type = 0x21;
+static uint8_t s_ctrl_in_bm_request_type  = 0xA1;
+static uint16_t s_ctrl_w_index = 0;
 
 // ログバッファ
 #define LOG_SIZE 8192
@@ -142,6 +185,21 @@ static uint8_t  s_ep_in        = 0;
 static uint16_t s_ep_out_mps   = 0;
 static uint16_t s_ep_in_mps    = 0;
 static uint32_t s_req_id       = 1;
+static uint8_t  s_comm_class   = 0;
+static uint8_t  s_comm_subclass= 0;
+static uint8_t  s_comm_proto   = 0;
+static uint8_t  s_data_class   = 0;
+static uint8_t  s_data_subclass= 0;
+static uint8_t  s_data_proto   = 0;
+static cdc_ncm_ntb_parameters_t s_ncm_params = {};
+static uint16_t s_ncm_tx_sequence = 0;
+static uint32_t s_rx_buf_size = BULK_BUF_SIZE;
+
+typedef enum {
+    USB_LINK_MODE_RNDIS,
+    USB_LINK_MODE_CDC_NCM,
+} usb_link_mode_t;
+static usb_link_mode_t s_link_mode = USB_LINK_MODE_RNDIS;
 
 static esp_netif_t *s_usb_netif = nullptr;
 static esp_netif_ip_info_t s_usb_ip;
@@ -293,7 +351,67 @@ static void ctrl_xfer_cb(usb_transfer_t *xfer) {
     xSemaphoreGive(s_ctrl_sem);
 }
 
-static esp_err_t ctrl_out(uint8_t bRequest, const void *data, uint16_t len) {
+static uint16_t align_up_u16(uint16_t value, uint16_t alignment) {
+    if (alignment <= 1) return value;
+    return (uint16_t)(((value + alignment - 1) / alignment) * alignment);
+}
+
+static uint16_t align_ncm_payload_u16(uint16_t value, uint16_t divisor, uint16_t remainder) {
+    if (divisor == 0) return value;
+    uint16_t mod = (uint16_t)(value % divisor);
+    if (mod == remainder) return value;
+    if (mod < remainder) return (uint16_t)(value + (remainder - mod));
+    return (uint16_t)(value + (divisor - mod + remainder));
+}
+
+static esp_err_t std_set_interface(uint8_t itf_num, uint8_t alt_setting) {
+    usb_transfer_t *xfer = NULL;
+    esp_err_t ret = usb_host_transfer_alloc(sizeof(usb_setup_packet_t), 0, &xfer);
+    if (ret != ESP_OK) {
+        log_append("SET_INTERFACE: alloc failed (%d)", ret);
+        return ret;
+    }
+
+    xfer->device_handle    = s_dev_hdl;
+    xfer->bEndpointAddress = 0;
+    xfer->callback         = ctrl_xfer_cb;
+    xfer->context          = nullptr;
+    xfer->timeout_ms       = 2000;
+    xfer->num_bytes        = sizeof(usb_setup_packet_t);
+
+    usb_setup_packet_t *setup = (usb_setup_packet_t *)xfer->data_buffer;
+    setup->bmRequestType = 0x01; // Host→Device, Standard, Interface
+    setup->bRequest      = 0x0B; // SET_INTERFACE
+    setup->wValue        = alt_setting;
+    setup->wIndex        = itf_num;
+    setup->wLength       = 0;
+
+    xSemaphoreTake(s_ctrl_sem, 0);
+    ret = usb_host_transfer_submit_control(s_client_hdl, xfer);
+    if (ret != ESP_OK) {
+        log_append("SET_INTERFACE: submit failed ret=%d if=%u alt=%u", ret, itf_num, alt_setting);
+        usb_host_transfer_free(xfer);
+        return ret;
+    }
+
+    bool ok = (xSemaphoreTake(s_ctrl_sem, pdMS_TO_TICKS(2000)) == pdTRUE);
+    if (!ok) {
+        log_append("SET_INTERFACE: timeout if=%u alt=%u", itf_num, alt_setting);
+        ret = ESP_ERR_TIMEOUT;
+    } else if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
+        log_append("SET_INTERFACE: status=%d if=%u alt=%u", xfer->status, itf_num, alt_setting);
+        ret = ESP_FAIL;
+    } else {
+        log_append("SET_INTERFACE: OK if=%u alt=%u", itf_num, alt_setting);
+        ret = ESP_OK;
+    }
+
+    usb_host_transfer_free(xfer);
+    return ret;
+}
+
+static esp_err_t ctrl_out_raw(uint8_t bRequest, uint8_t bmRequestType, uint16_t wIndex,
+                              const void *data, uint16_t len) {
     usb_transfer_t *xfer = NULL;
     esp_err_t ret = usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + len, 0, &xfer);
     if (ret != ESP_OK) {
@@ -309,12 +427,14 @@ static esp_err_t ctrl_out(uint8_t bRequest, const void *data, uint16_t len) {
     xfer->num_bytes        = sizeof(usb_setup_packet_t) + len;
 
     usb_setup_packet_t *s = (usb_setup_packet_t *)xfer->data_buffer;
-    s->bmRequestType = 0x21; // Host→Device, Class, Interface
+    s->bmRequestType = bmRequestType;
     s->bRequest      = bRequest;
     s->wValue        = 0;
-    s->wIndex        = s_comm_itf_num;
+    s->wIndex        = wIndex;
     s->wLength       = len;
-    memcpy(xfer->data_buffer + sizeof(usb_setup_packet_t), data, len);
+    if (len > 0) {
+        memcpy(xfer->data_buffer + sizeof(usb_setup_packet_t), data, len);
+    }
 
     xSemaphoreTake(s_ctrl_sem, 0);
     ret = usb_host_transfer_submit_control(s_client_hdl, xfer);
@@ -326,17 +446,57 @@ static esp_err_t ctrl_out(uint8_t bRequest, const void *data, uint16_t len) {
     bool ok = (xSemaphoreTake(s_ctrl_sem, pdMS_TO_TICKS(2000)) == pdTRUE);
     if (!ok) {
         log_append("ctrl_out: timeout");
+        s_last_ctrl_status = USB_TRANSFER_STATUS_TIMED_OUT;
         ret = ESP_FAIL;
     } else if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-        log_append("ctrl_out: status=%d", xfer->status);
+        s_last_ctrl_status = xfer->status;
+        log_append("ctrl_out: status=%d req=%u bm=%02X wIndex=%u",
+                   xfer->status, bRequest, bmRequestType, wIndex);
         ret = ESP_FAIL;
+    } else {
+        s_last_ctrl_status = USB_TRANSFER_STATUS_COMPLETED;
     }
     usb_host_transfer_free(xfer);
     return ret;
 }
 
-static esp_err_t ctrl_in(uint8_t bRequest, void *buf, uint16_t buf_len,
-                          uint16_t *actual_len) {
+static esp_err_t ctrl_out_try(uint8_t bRequest, uint8_t bmRequestType, uint16_t wIndex,
+                              const void *data, uint16_t len, const char *label) {
+    log_append("ctrl_out: try %s req=%u bm=%02X wIndex=%u", label, bRequest, bmRequestType, wIndex);
+    esp_err_t ret = ctrl_out_raw(bRequest, bmRequestType, wIndex, data, len);
+    if (ret == ESP_OK) {
+        s_ctrl_out_bm_request_type = bmRequestType;
+        s_ctrl_in_bm_request_type = (uint8_t)(bmRequestType | 0x80);
+        s_ctrl_w_index = wIndex;
+        log_append("ctrl_out: selected %s", label);
+    }
+    return ret;
+}
+
+static esp_err_t ctrl_out(uint8_t bRequest, const void *data, uint16_t len) {
+    esp_err_t ret = ctrl_out_try(bRequest, 0x21, s_comm_itf_num, data, len, "comm-interface");
+    if (ret == ESP_OK) return ESP_OK;
+    if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL &&
+        s_data_itf_num != 0xFF && s_data_itf_num != s_comm_itf_num) {
+        ret = ctrl_out_try(bRequest, 0x21, s_data_itf_num, data, len, "data-interface");
+        if (ret == ESP_OK || s_last_ctrl_status != USB_TRANSFER_STATUS_STALL) return ret;
+    }
+    if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL && s_comm_itf_num != 0) {
+        ret = ctrl_out_try(bRequest, 0x21, 0, data, len, "interface-zero");
+        if (ret == ESP_OK || s_last_ctrl_status != USB_TRANSFER_STATUS_STALL) return ret;
+    }
+    if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL) {
+        ret = ctrl_out_try(bRequest, 0x20, s_comm_itf_num, data, len, "device-recipient");
+        if (ret == ESP_OK || s_last_ctrl_status != USB_TRANSFER_STATUS_STALL) return ret;
+    }
+    if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL && s_comm_itf_num != 0) {
+        ret = ctrl_out_try(bRequest, 0x20, 0, data, len, "device-recipient-zero");
+    }
+    return ret;
+}
+
+static esp_err_t ctrl_in_raw(uint8_t bRequest, uint8_t bmRequestType, uint16_t wIndex, void *buf,
+                             uint16_t buf_len, uint16_t *actual_len) {
     usb_transfer_t *xfer = NULL;
     esp_err_t ret = usb_host_transfer_alloc(sizeof(usb_setup_packet_t) + buf_len, 0, &xfer);
     if (ret != ESP_OK) return ret;
@@ -349,10 +509,10 @@ static esp_err_t ctrl_in(uint8_t bRequest, void *buf, uint16_t buf_len,
     xfer->num_bytes        = sizeof(usb_setup_packet_t) + buf_len;
 
     usb_setup_packet_t *s = (usb_setup_packet_t *)xfer->data_buffer;
-    s->bmRequestType = 0xA1; // Device→Host, Class, Interface
+    s->bmRequestType = bmRequestType;
     s->bRequest      = bRequest;
     s->wValue        = 0;
-    s->wIndex        = s_comm_itf_num;
+    s->wIndex        = wIndex;
     s->wLength       = buf_len;
 
     *actual_len = 0;
@@ -366,14 +526,18 @@ static esp_err_t ctrl_in(uint8_t bRequest, void *buf, uint16_t buf_len,
     bool ok = (xSemaphoreTake(s_ctrl_sem, pdMS_TO_TICKS(2000)) == pdTRUE);
     if (!ok) {
         log_append("ctrl_in semaphore timeout");
+        s_last_ctrl_status = USB_TRANSFER_STATUS_TIMED_OUT;
         usb_host_transfer_free(xfer);
         return ESP_ERR_TIMEOUT;
     }
     if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-        log_append("ctrl_in status=%d", xfer->status);
+        s_last_ctrl_status = xfer->status;
+        log_append("ctrl_in: status=%d req=%u bm=%02X wIndex=%u",
+                   xfer->status, bRequest, bmRequestType, wIndex);
         usb_host_transfer_free(xfer);
         return ESP_FAIL;
     }
+    s_last_ctrl_status = USB_TRANSFER_STATUS_COMPLETED;
     int resp = xfer->actual_num_bytes - (int)sizeof(usb_setup_packet_t);
     if (resp > 0 && resp <= buf_len) {
         memcpy(buf, xfer->data_buffer + sizeof(usb_setup_packet_t), resp);
@@ -381,6 +545,36 @@ static esp_err_t ctrl_in(uint8_t bRequest, void *buf, uint16_t buf_len,
     }
     usb_host_transfer_free(xfer);
     return ESP_OK;
+}
+
+static esp_err_t ctrl_in_try(uint8_t bRequest, uint8_t bmRequestType, uint16_t wIndex, void *buf,
+                             uint16_t buf_len, uint16_t *actual_len, const char *label) {
+    log_append("ctrl_in: try %s req=%u bm=%02X wIndex=%u", label, bRequest, bmRequestType, wIndex);
+    return ctrl_in_raw(bRequest, bmRequestType, wIndex, buf, buf_len, actual_len);
+}
+
+static esp_err_t ctrl_in(uint8_t bRequest, void *buf, uint16_t buf_len,
+                         uint16_t *actual_len) {
+    esp_err_t ret = ctrl_in_try(bRequest, s_ctrl_in_bm_request_type, s_ctrl_w_index,
+                                buf, buf_len, actual_len, "selected");
+    if (ret == ESP_OK) return ESP_OK;
+    if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL &&
+        s_data_itf_num != 0xFF && s_data_itf_num != s_comm_itf_num) {
+        ret = ctrl_in_try(bRequest, 0xA1, s_data_itf_num, buf, buf_len, actual_len, "data-interface");
+        if (ret == ESP_OK || s_last_ctrl_status != USB_TRANSFER_STATUS_STALL) return ret;
+    }
+    if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL && s_comm_itf_num != 0) {
+        ret = ctrl_in_try(bRequest, 0xA1, 0, buf, buf_len, actual_len, "interface-zero");
+        if (ret == ESP_OK || s_last_ctrl_status != USB_TRANSFER_STATUS_STALL) return ret;
+    }
+    if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL) {
+        ret = ctrl_in_try(bRequest, 0xA0, s_comm_itf_num, buf, buf_len, actual_len, "device-recipient");
+        if (ret == ESP_OK || s_last_ctrl_status != USB_TRANSFER_STATUS_STALL) return ret;
+    }
+    if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL && s_comm_itf_num != 0) {
+        ret = ctrl_in_try(bRequest, 0xA0, 0, buf, buf_len, actual_len, "device-recipient-zero");
+    }
+    return ret;
 }
 
 // ─── ディスクリプタ解析 ──────────────────────────────────────────────────────
@@ -394,10 +588,12 @@ static bool parse_config_desc(void) {
     esp_err_t err = usb_host_get_active_config_descriptor(s_dev_hdl, &cfg);
     if (err != ESP_OK || !cfg) {
         M5.Display.printf("get_desc:%d\n", err);
+        log_append("get_desc: ret=%d", err);
         return false;
     }
 
     M5.Display.printf("nItf:%d len:%d\n", cfg->bNumInterfaces, cfg->wTotalLength);
+    log_append("config_desc: nItf=%d len=%d", cfg->bNumInterfaces, cfg->wTotalLength);
 
     const uint8_t *p   = (const uint8_t *)cfg;
     const uint8_t *end = p + cfg->wTotalLength;
@@ -405,32 +601,57 @@ static bool parse_config_desc(void) {
     uint8_t  cur_itf     = 0xFF;
     uint8_t  cur_alt     = 0;
     uint8_t  cur_class   = 0;
+    uint8_t  cur_subclass= 0;
+    uint8_t  cur_proto   = 0;
     bool     cur_intr_in = false; // Interrupt IN あり
     uint8_t  tmp_ep_intr = 0;     // Interrupt IN エンドポイント
     bool     cur_bulk_in = false;
     bool     cur_bulk_out= false;
     uint8_t  tmp_ep_in   = 0;
     uint8_t  tmp_ep_out  = 0;
+    int      best_comm_score = -1;
+    int      best_data_score = -1;
 
     auto commit_itf = [&]() {
         if (cur_itf == 0xFF) return;
-        M5.Display.printf(" Itf%d alt%d cl:%02X %s%s%s\n",
-                          cur_itf, cur_alt, cur_class,
+        M5.Display.printf(" Itf%d alt%d cl:%02X/%02X/%02X %s%s%s\n",
+                          cur_itf, cur_alt, cur_class, cur_subclass, cur_proto,
                           cur_intr_in  ? "I" : "-",
                           cur_bulk_in  ? "i" : "-",
                           cur_bulk_out ? "o" : "-");
-        // Interrupt IN だけある = コントロールインターフェース
-        if (cur_intr_in && s_comm_itf_num == 0xFF) {
+        log_append("itf=%d alt=%d class=%02X/%02X/%02X flags=%s%s%s",
+               cur_itf, cur_alt, cur_class, cur_subclass, cur_proto,
+               cur_intr_in  ? "I" : "-",
+               cur_bulk_in  ? "i" : "-",
+               cur_bulk_out ? "o" : "-");
+        const bool is_rndis_comm = (cur_class == 0xE0 && cur_subclass == 0x01 && cur_proto == 0x03);
+        const bool is_cdc_comm = (cur_class == 0x02);
+        const bool is_cdc_data = (cur_class == 0x0A);
+        int comm_score = -1;
+        if (is_rndis_comm) comm_score = 3;
+        else if (is_cdc_comm) comm_score = 2;
+        else if (cur_intr_in) comm_score = 1;
+        if (comm_score > best_comm_score) {
             s_comm_itf_num = cur_itf;
             s_comm_itf_alt = cur_alt;
             s_ep_intr = tmp_ep_intr;
+            s_comm_class = cur_class;
+            s_comm_subclass = cur_subclass;
+            s_comm_proto = cur_proto;
+            best_comm_score = comm_score;
         }
-        // Bulk IN + Bulk OUT = データインターフェース
-        if (cur_bulk_in && cur_bulk_out && s_data_itf_num == 0xFF) {
+        int data_score = -1;
+        if (cur_bulk_in && cur_bulk_out && is_cdc_data) data_score = 2;
+        else if (cur_bulk_in && cur_bulk_out) data_score = 1;
+        if (data_score > best_data_score) {
             s_data_itf_num = cur_itf;
             s_data_itf_alt = cur_alt;
             s_ep_in  = tmp_ep_in;
             s_ep_out = tmp_ep_out;
+            s_data_class = cur_class;
+            s_data_subclass = cur_subclass;
+            s_data_proto = cur_proto;
+            best_data_score = data_score;
         }
     };
 
@@ -444,6 +665,8 @@ static bool parse_config_desc(void) {
             cur_itf      = itf->bInterfaceNumber;
             cur_alt      = itf->bAlternateSetting;
             cur_class    = itf->bInterfaceClass;
+            cur_subclass = itf->bInterfaceSubClass;
+            cur_proto    = itf->bInterfaceProtocol;
             cur_intr_in  = false;
             tmp_ep_intr  = 0;
             cur_bulk_in  = false;
@@ -460,6 +683,7 @@ static bool parse_config_desc(void) {
             else if (ep_type == 2) ep_type_str = "BLK";
             else if (ep_type == 3) ep_type_str = "INT";
             M5.Display.printf("  EP:%02X %s %s\n", ep->bEndpointAddress, ep_type_str, is_in ? "IN" : "OUT");
+            log_append("ep=%02X type=%s dir=%s", ep->bEndpointAddress, ep_type_str, is_in ? "IN" : "OUT");
             if (ep_type == USB_TRANSFER_TYPE_INTR && is_in) {
                 cur_intr_in = true;
                 tmp_ep_intr = ep->bEndpointAddress;
@@ -491,9 +715,69 @@ static bool parse_config_desc(void) {
     M5.Display.printf("tmp_in:%02X tmp_out:%02X\n", tmp_ep_in, tmp_ep_out);
     M5.Display.printf("s_in:%02X s_out:%02X\n", s_ep_in, s_ep_out);
     M5.Display.printf("IN:%02X OUT:%02X\n", s_ep_in, s_ep_out);
+    log_append("selected: comm=%d alt=%d data=%d alt=%d",
+               s_comm_itf_num, s_comm_itf_alt, s_data_itf_num, s_data_itf_alt);
+    log_append("selected-class: comm=%02X/%02X/%02X data=%02X/%02X/%02X",
+               s_comm_class, s_comm_subclass, s_comm_proto,
+               s_data_class, s_data_subclass, s_data_proto);
+    log_append("endpoints: tmp_in=%02X tmp_out=%02X s_in=%02X s_out=%02X",
+               tmp_ep_in, tmp_ep_out, s_ep_in, s_ep_out);
     log_append("EP MPS - IN:%d OUT:%d", s_ep_in_mps, s_ep_out_mps);
 
     return (s_data_itf_num != 0xFF && s_ep_in != 0 && s_ep_out != 0);
+}
+
+static bool cdc_ncm_initialize(void) {
+    s_ctrl_out_bm_request_type = 0x21;
+    s_ctrl_in_bm_request_type = 0xA1;
+    s_ctrl_w_index = s_comm_itf_num;
+
+    memset(&s_ncm_params, 0, sizeof(s_ncm_params));
+    uint16_t len = 0;
+    if (ctrl_in(CDC_NCM_GET_NTB_PARAMETERS, &s_ncm_params, sizeof(s_ncm_params), &len) != ESP_OK) {
+        log_append("NCM GET_NTB_PARAMETERS failed");
+        return false;
+    }
+    if (len < sizeof(s_ncm_params)) {
+        log_append("NCM GET_NTB_PARAMETERS short response len=%u", len);
+        return false;
+    }
+
+    log_append("NCM params: fmt=%04X inMax=%u outMax=%u inDiv=%u inRem=%u inAlign=%u outDiv=%u outRem=%u outAlign=%u",
+               s_ncm_params.bmNtbFormatsSupported,
+               (unsigned)s_ncm_params.dwNtbInMaxSize,
+               (unsigned)s_ncm_params.dwNtbOutMaxSize,
+               s_ncm_params.wNdpInDivisor,
+               s_ncm_params.wNdpInPayloadRemainder,
+               s_ncm_params.wNdpInAlignment,
+               s_ncm_params.wNdpOutDivisor,
+               s_ncm_params.wNdpOutPayloadRemainder,
+               s_ncm_params.wNdpOutAlignment);
+
+    if ((s_ncm_params.bmNtbFormatsSupported & 0x0001u) == 0) {
+        log_append("NCM unsupported: NTB16 not supported");
+        return false;
+    }
+
+    if (ctrl_out(CDC_NCM_SET_NTB_FORMAT, nullptr, 0) != ESP_OK) {
+        log_append("NCM SET_NTB_FORMAT failed");
+        return false;
+    }
+
+    uint32_t ntb_input_size = s_ncm_params.dwNtbInMaxSize;
+    if (ntb_input_size == 0) ntb_input_size = BULK_BUF_SIZE;
+    if (ntb_input_size < BULK_BUF_SIZE) ntb_input_size = BULK_BUF_SIZE;
+    if (ntb_input_size > 16384u) ntb_input_size = 16384u;
+    if (ctrl_out(CDC_NCM_SET_NTB_INPUT_SIZE, &ntb_input_size, sizeof(ntb_input_size)) != ESP_OK) {
+        log_append("NCM SET_NTB_INPUT_SIZE failed");
+        return false;
+    }
+
+    s_rx_buf_size = ntb_input_size;
+
+    s_ncm_tx_sequence = 0;
+    log_append("NCM INIT: OK inputSize=%u rxBuf=%u", (unsigned)ntb_input_size, (unsigned)s_rx_buf_size);
+    return true;
 }
 
 // ─── RNDIS ハンドシェイク ─────────────────────────────────────────────────────
@@ -624,6 +908,10 @@ static bool rndis_query_oid(uint32_t oid, void *buf_out, uint16_t buf_len) {
 
 static uint32_t s_rx_count = 0;
 static uint32_t s_rx_bytes = 0;
+static uint32_t s_rx_frame_count = 0;
+static uint32_t s_rx_ipv4_count = 0;
+static uint32_t s_rx_ipv6_count = 0;
+static uint32_t s_rx_arp_count = 0;
 
 static bool parse_ipv4_udp_ports(const uint8_t *frame, size_t len, uint16_t *src_port, uint16_t *dst_port) {
     if (!frame || len < 14 + 20 + 8) return false;
@@ -646,6 +934,79 @@ static bool parse_ipv4_udp_ports(const uint8_t *frame, size_t len, uint16_t *src
     return true;
 }
 
+static bool parse_ipv6_icmp_type(const uint8_t *frame, size_t len, uint8_t *icmpv6_type) {
+    if (!frame || len < 14 + 40 + 1) return false;
+    uint16_t ether_type = ((uint16_t)frame[12] << 8) | frame[13];
+    if (ether_type != 0x86DD) return false;
+
+    const uint8_t *ip6 = frame + 14;
+    uint8_t version = ip6[0] >> 4;
+    if (version != 6) return false;
+
+    uint8_t next_header = ip6[6];
+    if (next_header != 58) return false;
+    if (icmpv6_type) *icmpv6_type = ip6[40];
+    return true;
+}
+
+static void deliver_rx_frame(const uint8_t *frame, size_t len) {
+    if (!frame || len == 0 || !s_usb_netif) return;
+
+    s_rx_frame_count++;
+    uint16_t ether_type = 0;
+    if (len >= 14) {
+        ether_type = ((uint16_t)frame[12] << 8) | frame[13];
+        if (ether_type == 0x0800) s_rx_ipv4_count++;
+        else if (ether_type == 0x86DD) s_rx_ipv6_count++;
+        else if (ether_type == 0x0806) s_rx_arp_count++;
+    }
+
+    if ((s_rx_frame_count % 32) == 1) {
+        log_append("RX frame[%u]: len=%d eth=0x%04X", (unsigned)s_rx_frame_count, (int)len, ether_type);
+        log_append("RX summary: ipv4=%u ipv6=%u arp=%u", (unsigned)s_rx_ipv4_count,
+                   (unsigned)s_rx_ipv6_count, (unsigned)s_rx_arp_count);
+    }
+
+    void *buf = malloc(len);
+    if (!buf) {
+        log_append("RX: alloc failed len=%d", (int)len);
+        return;
+    }
+
+    memcpy(buf, frame, len);
+    uint16_t src_port = 0, dst_port = 0;
+    if (parse_ipv4_udp_ports((const uint8_t *)buf, len, &src_port, &dst_port)) {
+        if ((src_port == 67 || src_port == 68) && (dst_port == 67 || dst_port == 68)) {
+            log_append("RX: DHCP frame len=%d %d->%d", (int)len, src_port, dst_port);
+        }
+        if (src_port == 53 || dst_port == 53) {
+            log_append("RX: DNS frame len=%d %d->%d", (int)len, src_port, dst_port);
+        }
+    } else if ((s_rx_frame_count % 32) == 1 && len >= 14) {
+        log_append("RX: non-UDP frame eth=0x%04X len=%d", ether_type, (int)len);
+    }
+
+    if (ether_type == 0x86DD) {
+        uint8_t icmpv6_type = 0;
+        if (parse_ipv6_icmp_type((const uint8_t *)buf, len, &icmpv6_type)) {
+            if ((s_rx_frame_count % 32) == 1 || icmpv6_type == 133 || icmpv6_type == 134 ||
+                icmpv6_type == 135 || icmpv6_type == 136) {
+                log_append("RX: ICMPv6 type=%u len=%d", icmpv6_type, (int)len);
+            }
+        }
+    }
+
+    if (s_rx_frame_count == 8 && s_rx_ipv4_count == 0) {
+        log_append("RX hint: IPv4 frame not seen yet (peer may not start DHCP client on usb)");
+    }
+
+    esp_err_t nret = esp_netif_receive(s_usb_netif, buf, len, buf);
+    if (nret != ESP_OK) {
+        log_append("RX: esp_netif_receive failed ret=%d", nret);
+        free(buf);
+    }
+}
+
 static void rx_callback(usb_transfer_t *xfer) {
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_rx_bytes += xfer->actual_num_bytes;
@@ -653,38 +1014,70 @@ static void rx_callback(usb_transfer_t *xfer) {
         if (xfer->actual_num_bytes > 0 && (s_rx_count % 512 == 1))
             log_append("RX[%d]: bytes=%d total=%d", s_rx_count, xfer->actual_num_bytes, s_rx_bytes);
 
-        if (xfer->actual_num_bytes > (int)RNDIS_PACKET_HEADER_SIZE) {
+        if (s_link_mode == USB_LINK_MODE_CDC_NCM &&
+            xfer->actual_num_bytes >= (int)sizeof(cdc_ncm_nth16_t)) {
+            const uint8_t *base = xfer->data_buffer;
+            const cdc_ncm_nth16_t *nth = (const cdc_ncm_nth16_t *)base;
+            if (nth->dwSignature == CDC_NCM_NTH16_SIGNATURE &&
+                nth->wBlockLength <= (uint16_t)xfer->actual_num_bytes &&
+                nth->wNdpIndex + sizeof(cdc_ncm_ndp16_t) <= nth->wBlockLength) {
+                log_append("NCM RX: nth seq=%u block=%u ndp=%u", nth->wSequence, nth->wBlockLength, nth->wNdpIndex);
+                uint16_t ndp_index = nth->wNdpIndex;
+                int ndp_count = 0;
+                int delivered = 0;
+                while (ndp_index != 0 && ndp_count < 4 &&
+                       ndp_index + sizeof(cdc_ncm_ndp16_t) <= nth->wBlockLength) {
+                    const cdc_ncm_ndp16_t *ndp = (const cdc_ncm_ndp16_t *)(base + ndp_index);
+                    if (ndp->dwSignature != CDC_NCM_NDP16_SIGNATURE ||
+                        ndp->wLength < (sizeof(cdc_ncm_ndp16_t) + sizeof(cdc_ncm_dpe16_t) * 2) ||
+                        ndp_index + ndp->wLength > nth->wBlockLength) {
+                        log_append("NCM RX: invalid NDP sig=%08X len=%u", ndp->dwSignature, ndp->wLength);
+                        break;
+                    }
+
+                    const cdc_ncm_dpe16_t *dpe = (const cdc_ncm_dpe16_t *)(base + ndp_index + sizeof(cdc_ncm_ndp16_t));
+                    int dpe_count = (ndp->wLength - sizeof(cdc_ncm_ndp16_t)) / sizeof(cdc_ncm_dpe16_t);
+                    for (int idx = 0; idx < dpe_count; ++idx) {
+                        uint16_t frame_index = dpe[idx].wDatagramIndex;
+                        uint16_t frame_len = dpe[idx].wDatagramLength;
+                        if (frame_index == 0 || frame_len == 0) break;
+                        if ((uint32_t)frame_index + frame_len > nth->wBlockLength) {
+                            log_append("NCM RX: invalid frame index=%u len=%u", frame_index, frame_len);
+                            break;
+                        }
+                        deliver_rx_frame(base + frame_index, frame_len);
+                        delivered++;
+                    }
+
+                    if (ndp->wNextNdpIndex == 0 || ndp->wNextNdpIndex == ndp_index) break;
+                    ndp_index = ndp->wNextNdpIndex;
+                    ndp_count++;
+                }
+                if (delivered == 0) {
+                    log_append("NCM RX: no datagrams in NTB");
+                }
+            } else {
+                log_append("NCM RX: invalid NTH sig=%08X len=%d", nth->dwSignature, xfer->actual_num_bytes);
+            }
+        } else if (xfer->actual_num_bytes > (int)RNDIS_PACKET_HEADER_SIZE) {
             const rndis_packet_msg_t *hdr = (const rndis_packet_msg_t *)xfer->data_buffer;
             if (hdr->MessageType == RNDIS_PACKET_MSG) {
                 uint32_t off = 8 + hdr->DataOffset; // &DataOffset からのオフセット
                 uint32_t dlen = hdr->DataLength;
-                if (off + dlen <= (uint32_t)xfer->actual_num_bytes && s_usb_netif) {
-                    void *buf = malloc(dlen);
-                    if (buf) {
-                        memcpy(buf, xfer->data_buffer + off, dlen);
-                        uint16_t src_port = 0, dst_port = 0;
-                        if (parse_ipv4_udp_ports((const uint8_t *)buf, dlen, &src_port, &dst_port)) {
-                            if ((src_port == 67 || src_port == 68) && (dst_port == 67 || dst_port == 68)) {
-                            log_append("RX: DHCP frame len=%d %d->%d", dlen, src_port, dst_port);
-                            }
-                            if (src_port == 53 || dst_port == 53) {
-                                log_append("RX: DNS frame len=%d %d->%d", dlen, src_port, dst_port);
-                            }
-                        }
-                        esp_err_t nret = esp_netif_receive(s_usb_netif, buf, dlen, buf);
-                        if (nret != ESP_OK) {
-                            log_append("RX: esp_netif_receive failed ret=%d", nret);
-                            free(buf);
-                        }
-                    }
+                if (off + dlen <= (uint32_t)xfer->actual_num_bytes) {
+                    deliver_rx_frame(xfer->data_buffer + off, dlen);
                 }
             }
         }
     } else {
         log_append("RX error: status=%d bytes=%d", xfer->status, xfer->actual_num_bytes);
     }
-    if (s_rndis_state == RNDIS_STATE_READY)
-        usb_host_transfer_submit(xfer); // エラー時も次の受信を再投入
+    if (s_rndis_state == RNDIS_STATE_READY) {
+        esp_err_t ret = usb_host_transfer_submit(xfer); // エラー時も次の受信を再投入
+        if (ret != ESP_OK) {
+            log_append("RX resubmit failed: ret=%d", ret);
+        }
+    }
 }
 
 static void tx_callback(usb_transfer_t *xfer) {
@@ -717,9 +1110,13 @@ static void start_intr(void) {
 }
 
 static void start_rx(void) {
-    if (s_rx_xfer == NULL) {
-        esp_err_t ret = usb_host_transfer_alloc(BULK_BUF_SIZE, 0, &s_rx_xfer);
-        log_append("RX alloc: ret=%d ptr=%p", ret, s_rx_xfer);
+    if (s_rx_xfer == NULL || s_rx_xfer->num_bytes < (int)s_rx_buf_size) {
+        if (s_rx_xfer != NULL) {
+            usb_host_transfer_free(s_rx_xfer);
+            s_rx_xfer = NULL;
+        }
+        esp_err_t ret = usb_host_transfer_alloc(s_rx_buf_size, 0, &s_rx_xfer);
+        log_append("RX alloc: ret=%d ptr=%p size=%u", ret, s_rx_xfer, (unsigned)s_rx_buf_size);
         if (ret != ESP_OK || s_rx_xfer == NULL) {
             log_append("RX alloc failed!");
             return;
@@ -740,9 +1137,10 @@ static void start_rx(void) {
 
     s_rx_xfer->device_handle    = s_dev_hdl;
     s_rx_xfer->bEndpointAddress = s_ep_in;
-    s_rx_xfer->num_bytes        = BULK_BUF_SIZE;
+    s_rx_xfer->num_bytes        = s_rx_buf_size;
 
-    log_append("RX submit: dev=%p ep=0x%02X (state=%d)", s_dev_hdl, s_ep_in, s_rndis_state);
+    log_append("RX submit: dev=%p ep=0x%02X size=%u (state=%d)",
+               s_dev_hdl, s_ep_in, (unsigned)s_rx_buf_size, s_rndis_state);
     esp_err_t ret = usb_host_transfer_submit(s_rx_xfer);
     log_append("RX submit result: ret=%d", ret);
     if (ret != ESP_OK) {
@@ -804,6 +1202,16 @@ static void cleanup_rndis_device(bool from_disconnect) {
     s_ep_out = 0;
     s_ep_in_mps = 0;
     s_ep_out_mps = 0;
+    s_comm_class = 0;
+    s_comm_subclass = 0;
+    s_comm_proto = 0;
+    s_data_class = 0;
+    s_data_subclass = 0;
+    s_data_proto = 0;
+    memset(&s_ncm_params, 0, sizeof(s_ncm_params));
+    s_ncm_tx_sequence = 0;
+    s_rx_buf_size = BULK_BUF_SIZE;
+    s_link_mode = USB_LINK_MODE_RNDIS;
 
     // 転送オブジェクト自体は保持して再接続時に再利用する（in-flight free 競合回避）
     if (s_rx_xfer) {
@@ -817,6 +1225,7 @@ static void cleanup_rndis_device(bool from_disconnect) {
 
     if (from_disconnect) {
         M5.Display.println("Dev gone");
+        log_append("Dev gone");
     }
 }
 
@@ -830,6 +1239,7 @@ static void rndis_setup_task(void *arg) {
         // デバイスオープン
         if (usb_host_device_open(s_client_hdl, dev_addr, &s_dev_hdl) != ESP_OK) {
             M5.Display.println("Open fail");
+            log_append("Open fail");
             cleanup_rndis_device(false);
             continue;
         }
@@ -842,9 +1252,15 @@ static void rndis_setup_task(void *arg) {
         s_ep_in = 0; s_ep_out = 0;
         if (!parse_config_desc()) {
             M5.Display.println("Desc fail");
+            log_append("Desc fail");
             cleanup_rndis_device(false);
             continue;
         }
+
+        const bool is_cdc_ncm = (s_comm_class == 0x02 && s_comm_subclass == 0x0D &&
+                                 s_data_class == 0x0A);
+        s_link_mode = is_cdc_ncm ? USB_LINK_MODE_CDC_NCM : USB_LINK_MODE_RNDIS;
+        log_append("Link mode: %s", is_cdc_ncm ? "CDC-NCM" : "RNDIS");
 
         // インターフェース Claim
         esp_err_t ret_comm = usb_host_interface_claim(s_client_hdl, s_dev_hdl, s_comm_itf_num, s_comm_itf_alt);
@@ -855,6 +1271,7 @@ static void rndis_setup_task(void *arg) {
             M5.Display.setTextColor(RED);
             M5.Display.println("Itf claim fail");
             M5.Display.setTextColor(WHITE);
+            log_append("Itf claim fail");
             s_rndis_state = RNDIS_STATE_ERROR;
             cleanup_rndis_device(false);
             continue;
@@ -862,33 +1279,59 @@ static void rndis_setup_task(void *arg) {
 
         s_rndis_state = RNDIS_STATE_CONNECTED;
         M5.Display.println("Itf claimed");
+        log_append("Itf claimed");
 
-        // RNDIS INITIALIZE
-        if (!rndis_initialize()) {
+        if (s_data_itf_alt != 0) {
+            esp_err_t set_alt_ret = std_set_interface(s_data_itf_num, s_data_itf_alt);
+            if (set_alt_ret != ESP_OK) {
+                M5.Display.setTextColor(RED);
+                M5.Display.println("SET_INTERFACE fail");
+                M5.Display.setTextColor(WHITE);
+                log_append("SET_INTERFACE failed for data if=%u alt=%u ret=%d",
+                           s_data_itf_num, s_data_itf_alt, set_alt_ret);
+                s_rndis_state = RNDIS_STATE_ERROR;
+                cleanup_rndis_device(false);
+                continue;
+            }
+        }
+        s_ctrl_out_bm_request_type = 0x21;
+        s_ctrl_in_bm_request_type = 0xA1;
+        s_ctrl_w_index = s_comm_itf_num;
+
+        bool init_ok = false;
+        if (s_link_mode == USB_LINK_MODE_CDC_NCM) {
+            init_ok = cdc_ncm_initialize();
+        } else {
+            init_ok = rndis_initialize();
+        }
+        if (!init_ok) {
             M5.Display.setTextColor(RED);
-            M5.Display.println("RNDIS INIT fail");
+            M5.Display.println(s_link_mode == USB_LINK_MODE_CDC_NCM ? "NCM INIT fail" : "RNDIS INIT fail");
             M5.Display.setTextColor(WHITE);
+            log_append("%s INIT fail", s_link_mode == USB_LINK_MODE_CDC_NCM ? "NCM" : "RNDIS");
             s_rndis_state = RNDIS_STATE_ERROR;
             cleanup_rndis_device(false);
             continue;
         }
         s_rndis_state = RNDIS_STATE_INITIALIZED;
         M5.Display.println("INIT OK");
+        log_append("INIT OK");
 
         // MAC 取得（Windows CE RNDISはQUERY_MACをサポートしていない可能性があるのでスキップ）
         uint8_t client_mac[6] = {0x02, 0x50, 0xF2, 0x00, 0x00, 0x01}; // Default RNDIS MAC
         log_append("RNDIS MAC: using default %02X:%02X:%02X:%02X:%02X:%02X",
                    client_mac[0], client_mac[1], client_mac[2], client_mac[3], client_mac[4], client_mac[5]);
 
-        // パケットフィルタ設定
-        if (!rndis_set_filter()) {
-            M5.Display.setTextColor(RED);
-            M5.Display.println("Filter fail");
-            M5.Display.setTextColor(WHITE);
-            log_append("RNDIS SET_FILTER failed");
-            s_rndis_state = RNDIS_STATE_ERROR;
-            cleanup_rndis_device(false);
-            continue;
+        if (s_link_mode == USB_LINK_MODE_RNDIS) {
+            if (!rndis_set_filter()) {
+                M5.Display.setTextColor(RED);
+                M5.Display.println("Filter fail");
+                M5.Display.setTextColor(WHITE);
+                log_append("RNDIS SET_FILTER failed");
+                s_rndis_state = RNDIS_STATE_ERROR;
+                cleanup_rndis_device(false);
+                continue;
+            }
         }
 
         // デバイスが完全に初期化されるまで大幅に待機（Windows CE RNDIS ドライバ初期化時間）
@@ -949,6 +1392,7 @@ static void rndis_setup_task(void *arg) {
 static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg) {
     if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
         M5.Display.println("Dev connected");
+        log_append("Dev connected");
         log_append("USB Device connected");
         // ブロッキング処理は rndis_setup_task に委譲する
         uint8_t addr = msg->new_dev.address;
@@ -998,10 +1442,6 @@ static esp_err_t usb_driver_transmit(void *h, void *buf, size_t len) {
         log_append("TX drop: state=%d tx=%p dev=%p", s_rndis_state, s_tx_xfer, s_dev_hdl);
         return ESP_ERR_INVALID_STATE;
     }
-    if (len > BULK_BUF_SIZE - RNDIS_PACKET_HEADER_SIZE) {
-        log_append("TX drop: oversize len=%d", (int)len);
-        return ESP_ERR_INVALID_ARG;
-    }
 
     if (xSemaphoreTake(s_tx_sem, pdMS_TO_TICKS(50)) != pdTRUE) {
         log_append("TX busy: semaphore timeout");
@@ -1018,16 +1458,63 @@ static esp_err_t usb_driver_transmit(void *h, void *buf, size_t len) {
         }
     }
 
-    rndis_packet_msg_t *hdr = (rndis_packet_msg_t *)s_tx_xfer->data_buffer;
-    hdr->MessageType         = RNDIS_PACKET_MSG;
-    hdr->MessageLength       = (uint32_t)(RNDIS_PACKET_HEADER_SIZE + len);
-    hdr->DataOffset          = RNDIS_DATA_OFFSET;
-    hdr->DataLength          = (uint32_t)len;
-    hdr->OOBDataOffset       = 0; hdr->OOBDataLength    = 0;
-    hdr->NumOOBDataElements  = 0; hdr->PerPacketInfoOffset = 0;
-    hdr->PerPacketInfoLength = 0; hdr->VcHandle          = 0; hdr->Reserved = 0;
-    memcpy(s_tx_xfer->data_buffer + RNDIS_PACKET_HEADER_SIZE, buf, len);
-    s_tx_xfer->num_bytes = (int)(RNDIS_PACKET_HEADER_SIZE + len);
+    if (s_link_mode == USB_LINK_MODE_CDC_NCM) {
+        uint16_t ndp_alignment = s_ncm_params.wNdpOutAlignment;
+        uint16_t ndp_index = align_up_u16((uint16_t)sizeof(cdc_ncm_nth16_t), ndp_alignment);
+        uint16_t ndp_length = (uint16_t)(sizeof(cdc_ncm_ndp16_t) + sizeof(cdc_ncm_dpe16_t) * 2);
+        uint16_t payload_index = align_ncm_payload_u16((uint16_t)(ndp_index + ndp_length),
+                                                       s_ncm_params.wNdpOutDivisor,
+                                                       s_ncm_params.wNdpOutPayloadRemainder);
+        uint32_t block_length = (uint32_t)payload_index + (uint32_t)len;
+        uint32_t ntb_out_max = s_ncm_params.dwNtbOutMaxSize;
+        if (ntb_out_max == 0 || ntb_out_max > BULK_BUF_SIZE) ntb_out_max = BULK_BUF_SIZE;
+        if (block_length > ntb_out_max) {
+            log_append("TX drop: NCM oversize len=%d block=%u max=%u", (int)len,
+                       (unsigned)block_length, (unsigned)ntb_out_max);
+            xSemaphoreGive(s_tx_sem);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        memset(s_tx_xfer->data_buffer, 0, block_length);
+        cdc_ncm_nth16_t *nth = (cdc_ncm_nth16_t *)s_tx_xfer->data_buffer;
+        nth->dwSignature = CDC_NCM_NTH16_SIGNATURE;
+        nth->wHeaderLength = sizeof(cdc_ncm_nth16_t);
+        nth->wSequence = s_ncm_tx_sequence++;
+        nth->wBlockLength = (uint16_t)block_length;
+        nth->wNdpIndex = ndp_index;
+
+        cdc_ncm_ndp16_t *ndp = (cdc_ncm_ndp16_t *)(s_tx_xfer->data_buffer + ndp_index);
+        ndp->dwSignature = CDC_NCM_NDP16_SIGNATURE;
+        ndp->wLength = ndp_length;
+        ndp->wNextNdpIndex = 0;
+
+        cdc_ncm_dpe16_t *dpe = (cdc_ncm_dpe16_t *)(s_tx_xfer->data_buffer + ndp_index + sizeof(cdc_ncm_ndp16_t));
+        dpe[0].wDatagramIndex = payload_index;
+        dpe[0].wDatagramLength = (uint16_t)len;
+        dpe[1].wDatagramIndex = 0;
+        dpe[1].wDatagramLength = 0;
+
+        memcpy(s_tx_xfer->data_buffer + payload_index, buf, len);
+        s_tx_xfer->num_bytes = (int)block_length;
+    } else {
+        if (len > BULK_BUF_SIZE - RNDIS_PACKET_HEADER_SIZE) {
+            log_append("TX drop: oversize len=%d", (int)len);
+            xSemaphoreGive(s_tx_sem);
+            return ESP_ERR_INVALID_ARG;
+        }
+
+        rndis_packet_msg_t *hdr = (rndis_packet_msg_t *)s_tx_xfer->data_buffer;
+        hdr->MessageType         = RNDIS_PACKET_MSG;
+        hdr->MessageLength       = (uint32_t)(RNDIS_PACKET_HEADER_SIZE + len);
+        hdr->DataOffset          = RNDIS_DATA_OFFSET;
+        hdr->DataLength          = (uint32_t)len;
+        hdr->OOBDataOffset       = 0; hdr->OOBDataLength    = 0;
+        hdr->NumOOBDataElements  = 0; hdr->PerPacketInfoOffset = 0;
+        hdr->PerPacketInfoLength = 0; hdr->VcHandle          = 0; hdr->Reserved = 0;
+        memcpy(s_tx_xfer->data_buffer + RNDIS_PACKET_HEADER_SIZE, buf, len);
+        s_tx_xfer->num_bytes = (int)(RNDIS_PACKET_HEADER_SIZE + len);
+    }
+
     esp_err_t tret = usb_host_transfer_submit(s_tx_xfer);
     if (tret != ESP_OK) {
         log_append("TX submit failed: ret=%d ep=0x%02X bytes=%d", tret, s_ep_out, s_tx_xfer->num_bytes);
@@ -1189,9 +1676,11 @@ void setup() {
     M5.Display.println("HTTP server started");
     log_append("HTTP server: mode=%s", s_http_rndis_only ? "RNDIS only" : "all interfaces");
 
-    // 2. esp-netif (DHCP サーバ, 192.168.4.1)
+    // 2. esp-netif (DHCP サーバ, 192.168.37.1)
     s_usb_netif = create_usb_netif();
-    M5.Display.printf("HTTP: http://192.168.4.1/\n");
+    M5.Display.printf("HTTP: http://%d.%d.%d.%d/\n",
+                      ip4_addr1(&s_usb_ip.ip), ip4_addr2(&s_usb_ip.ip),
+                      ip4_addr3(&s_usb_ip.ip), ip4_addr4(&s_usb_ip.ip));
     static UsbDriver drv;
     drv.base.post_attach = usb_driver_post_attach;
     drv.base.netif       = nullptr;
@@ -1205,7 +1694,9 @@ void setup() {
     log_append("esp_netif: stopped DHCP server");
 
     esp_err_t ret = esp_netif_set_ip_info(s_usb_netif, &s_usb_ip);
-    log_append("esp_netif: set_ip_info ret=%d (IP=192.168.4.1)", ret);
+    log_append("esp_netif: set_ip_info ret=%d (IP=%d.%d.%d.%d)", ret,
+               ip4_addr1(&s_usb_ip.ip), ip4_addr2(&s_usb_ip.ip),
+               ip4_addr3(&s_usb_ip.ip), ip4_addr4(&s_usb_ip.ip));
 
     // DHCP で DNS サーバーに AtomS3 自身を通知する（DNSリレー前提）  // RNDIS側は常に本機へ問い合わせ
     log_append("DHCP DNS: %d.%d.%d.%d (AtomS3)",
@@ -1220,7 +1711,9 @@ void setup() {
 
     if (ret == ESP_OK) {
         M5.Display.println("DHCP server started");
-        log_append("DHCP server: ready at 192.168.4.1");
+        log_append("DHCP server: ready at %d.%d.%d.%d",
+               ip4_addr1(&s_usb_ip.ip), ip4_addr2(&s_usb_ip.ip),
+               ip4_addr3(&s_usb_ip.ip), ip4_addr4(&s_usb_ip.ip));
 
         // ─ DNS リレーサーバー設定 ─
         // RNDIS側からのDNS問い合わせをWi-Fi側に転送するよう lwIP を設定
