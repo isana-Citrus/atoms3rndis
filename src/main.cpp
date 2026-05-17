@@ -128,7 +128,7 @@ static void log_append(const char *fmt, ...) {
     va_start(args, fmt);
     s_log_pos += vsnprintf(s_log_buffer + s_log_pos, LOG_SIZE - s_log_pos, fmt, args);
     va_end(args);
-    s_log_pos += snprintf(s_log_buffer + s_log_pos, LOG_SIZE - s_log_pos, "<br>\n");
+    s_log_pos += snprintf(s_log_buffer + s_log_pos, LOG_SIZE - s_log_pos, "\n");
 }
 
 static usb_host_client_handle_t s_client_hdl = NULL;
