@@ -24,6 +24,9 @@
 #include "esp_netif.h"
 #include "lwip/lwip_napt.h"
 #include "lwip/ip4_addr.h"
+#include "lwip/dns.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
 
 // FreeRTOS
 #include "freertos/FreeRTOS.h"
@@ -108,6 +111,11 @@ static WiFiServer server(80);
 static IPAddress s_local_ip;
 static bool s_wifi_connected = false;
 static bool s_http_rndis_only = true;
+static IPAddress s_upstream_dns_ip;
+static volatile uint32_t s_dns_query_count = 0;
+static volatile uint32_t s_dns_reply_count = 0;
+static volatile uint32_t s_dns_timeout_count = 0;
+static bool s_dns_task_started = false;
 
 // ログバッファ
 #define LOG_SIZE 8192
@@ -165,6 +173,118 @@ static usb_transfer_t *s_intr_xfer = NULL;
 static uint8_t s_ep_intr = 0;  // Interrupt IN エンドポイント
 // デバイス接続通知キュー（アドレスを event callback → setup task に渡す）
 static QueueHandle_t s_dev_queue = NULL;
+
+static void dns_relay_task(void *arg) {
+    (void)arg;
+
+    const int kDnsPort = 53;
+    uint8_t *query_buf = (uint8_t *)malloc(1232);
+    uint8_t *reply_buf = (uint8_t *)malloc(1232);
+    if (!query_buf || !reply_buf) {
+        log_append("DNS relay: buffer alloc failed");
+        free(query_buf);
+        free(reply_buf);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    int listen_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (listen_sock < 0) {
+        log_append("DNS relay: socket create failed");
+        free(query_buf);
+        free(reply_buf);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    sockaddr_in listen_addr = {};
+    listen_addr.sin_family = AF_INET;
+    listen_addr.sin_port = htons(kDnsPort);
+    listen_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(listen_sock, (sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
+        log_append("DNS relay: bind UDP/53 failed");
+        close(listen_sock);
+        free(query_buf);
+        free(reply_buf);
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    timeval rx_to = {};
+    rx_to.tv_sec = 2;
+    rx_to.tv_usec = 0;
+    setsockopt(listen_sock, SOL_SOCKET, SO_RCVTIMEO, &rx_to, sizeof(rx_to));
+
+    log_append("DNS relay: listening UDP/53");
+
+    while (true) {
+        sockaddr_in client_addr = {};
+        socklen_t client_len = sizeof(client_addr);
+        int query_len = recvfrom(listen_sock, query_buf, 1232, 0,
+                                 (sockaddr *)&client_addr, &client_len);
+        if (query_len <= 0) {
+            // 受信エラー/未到着時に高優先度スピンしないよう必ずCPUを明け渡す
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        s_dns_query_count++;
+
+        int upstream_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (upstream_sock < 0) {
+            log_append("DNS relay: upstream socket create failed");
+            continue;
+        }
+
+        timeval upstream_to = {};
+        upstream_to.tv_sec = 2;
+        upstream_to.tv_usec = 0;
+        setsockopt(upstream_sock, SOL_SOCKET, SO_RCVTIMEO, &upstream_to, sizeof(upstream_to));
+
+        char dns_ip_str[16];
+        snprintf(dns_ip_str, sizeof(dns_ip_str), "%u.%u.%u.%u",
+                 s_upstream_dns_ip[0], s_upstream_dns_ip[1], s_upstream_dns_ip[2], s_upstream_dns_ip[3]);
+
+        sockaddr_in upstream_addr = {};
+        upstream_addr.sin_family = AF_INET;
+        upstream_addr.sin_port = htons(kDnsPort);
+        if (!inet_aton(dns_ip_str, &upstream_addr.sin_addr)) {
+            log_append("DNS relay: invalid upstream DNS IP");
+            close(upstream_sock);
+            continue;
+        }
+
+        int sent = sendto(upstream_sock, query_buf, query_len, 0,
+                          (sockaddr *)&upstream_addr, sizeof(upstream_addr));
+        if (sent != query_len) {
+            log_append("DNS relay: send upstream failed");
+            close(upstream_sock);
+            continue;
+        }
+
+        int reply_len = recvfrom(upstream_sock, reply_buf, 1232, 0, nullptr, nullptr);
+        close(upstream_sock);
+        if (reply_len <= 0) {
+            s_dns_timeout_count++;
+            if ((s_dns_timeout_count % 16) == 1) {
+                log_append("DNS relay: upstream timeout count=%u", (unsigned)s_dns_timeout_count);
+            }
+            continue;
+        }
+
+        int sent_back = sendto(listen_sock, reply_buf, reply_len, 0, (sockaddr *)&client_addr, client_len);
+        if (sent_back == reply_len) {
+            s_dns_reply_count++;
+            if ((s_dns_reply_count % 16) == 1) {
+                log_append("DNS relay: ok q=%u r=%u t=%u",   // 問い合わせ/応答/タイムアウト統計
+                           (unsigned)s_dns_query_count,
+                           (unsigned)s_dns_reply_count,
+                           (unsigned)s_dns_timeout_count);
+            }
+        } else {
+            log_append("DNS relay: send back failed len=%d sent=%d", reply_len, sent_back);
+        }
+    }
+}
 
 // ─── コントロール転送ヘルパー ─────────────────────────────────────────────────
 
@@ -505,7 +625,7 @@ static bool rndis_query_oid(uint32_t oid, void *buf_out, uint16_t buf_len) {
 static uint32_t s_rx_count = 0;
 static uint32_t s_rx_bytes = 0;
 
-static bool parse_dhcp_udp_ports(const uint8_t *frame, size_t len, uint16_t *src_port, uint16_t *dst_port) {
+static bool parse_ipv4_udp_ports(const uint8_t *frame, size_t len, uint16_t *src_port, uint16_t *dst_port) {
     if (!frame || len < 14 + 20 + 8) return false;
     uint16_t ether_type = ((uint16_t)frame[12] << 8) | frame[13];
     if (ether_type != 0x0800) return false;
@@ -520,7 +640,6 @@ static bool parse_dhcp_udp_ports(const uint8_t *frame, size_t len, uint16_t *src
     const uint8_t *udp = ip + ihl;
     uint16_t sp = ((uint16_t)udp[0] << 8) | udp[1];
     uint16_t dp = ((uint16_t)udp[2] << 8) | udp[3];
-    if (!((sp == 67 || sp == 68) && (dp == 67 || dp == 68))) return false;
 
     if (src_port) *src_port = sp;
     if (dst_port) *dst_port = dp;
@@ -544,8 +663,13 @@ static void rx_callback(usb_transfer_t *xfer) {
                     if (buf) {
                         memcpy(buf, xfer->data_buffer + off, dlen);
                         uint16_t src_port = 0, dst_port = 0;
-                        if (parse_dhcp_udp_ports((const uint8_t *)buf, dlen, &src_port, &dst_port)) {
+                        if (parse_ipv4_udp_ports((const uint8_t *)buf, dlen, &src_port, &dst_port)) {
+                            if ((src_port == 67 || src_port == 68) && (dst_port == 67 || dst_port == 68)) {
                             log_append("RX: DHCP frame len=%d %d->%d", dlen, src_port, dst_port);
+                            }
+                            if (src_port == 53 || dst_port == 53) {
+                                log_append("RX: DNS frame len=%d %d->%d", dlen, src_port, dst_port);
+                            }
                         }
                         esp_err_t nret = esp_netif_receive(s_usb_netif, buf, dlen, buf);
                         if (nret != ESP_OK) {
@@ -790,6 +914,15 @@ static void rndis_setup_task(void *arg) {
             esp_netif_tcpip_exec(enable_napt_cb, nullptr); // lwIPタスクで NAPT 有効化
             log_append("esp_netif: action_start + action_connected, NAPT enabled");
         }
+        if (!s_dns_task_started) {
+            if (xTaskCreate(dns_relay_task, "dns_relay", 4096, nullptr,
+                            tskIDLE_PRIORITY + 1, nullptr) == pdPASS) {
+                s_dns_task_started = true;
+                log_append("DNS relay: task started");
+            } else {
+                log_append("DNS relay: task create failed");
+            }
+        }
         start_rx();
         log_append("RX started, waiting for data...");
         M5.Display.fillScreen(BLACK);
@@ -798,6 +931,16 @@ static void rndis_setup_task(void *arg) {
         M5.Display.setTextColor(GREEN);
         M5.Display.println("RNDIS Ready!");
         M5.Display.setTextColor(WHITE);
+        M5.Display.print("WLAN: ");
+        M5.Display.println(WiFi.localIP());
+        // RNDIS側のIP表示
+        if (s_usb_netif) {
+            esp_netif_ip_info_t ip_info;
+            if (esp_netif_get_ip_info(s_usb_netif, &ip_info) == ESP_OK) {
+                M5.Display.print("USB: ");
+                M5.Display.println(ip4addr_ntoa((const ip4_addr_t *)&ip_info.ip));
+            }
+        }
     }
 }
 
@@ -866,8 +1009,13 @@ static esp_err_t usb_driver_transmit(void *h, void *buf, size_t len) {
     }
 
     uint16_t src_port = 0, dst_port = 0;
-    if (parse_dhcp_udp_ports((const uint8_t *)buf, len, &src_port, &dst_port)) {
-        log_append("TX: DHCP frame len=%d %d->%d", (int)len, src_port, dst_port);
+    if (parse_ipv4_udp_ports((const uint8_t *)buf, len, &src_port, &dst_port)) {
+        if ((src_port == 67 || src_port == 68) && (dst_port == 67 || dst_port == 68)) {
+            log_append("TX: DHCP frame len=%d %d->%d", (int)len, src_port, dst_port);
+        }
+        if (src_port == 53 || dst_port == 53) {
+            log_append("TX: DNS frame len=%d %d->%d", (int)len, src_port, dst_port);
+        }
     }
 
     rndis_packet_msg_t *hdr = (rndis_packet_msg_t *)s_tx_xfer->data_buffer;
@@ -1034,6 +1182,7 @@ void setup() {
     s_local_ip = WiFi.localIP();
     s_wifi_connected = true;
     IPAddress s_dns_ip = WiFi.dnsIP(); // Wi-Fi プライマリ DNS を取得
+    s_upstream_dns_ip = s_dns_ip;
 
     // HTTP サーバー開始
     server.begin();
@@ -1058,11 +1207,11 @@ void setup() {
     esp_err_t ret = esp_netif_set_ip_info(s_usb_netif, &s_usb_ip);
     log_append("esp_netif: set_ip_info ret=%d (IP=192.168.4.1)", ret);
 
-    // DHCP で DNS サーバー (Wi-Fi プライマリ DNS) を通知
-    // esp_netif_set_dns_info は ETH+DHCP_SERVER モードで DHCP オファーに DNS を含める
-    log_append("DHCP DNS: %d.%d.%d.%d", s_dns_ip[0], s_dns_ip[1], s_dns_ip[2], s_dns_ip[3]);
+    // DHCP で DNS サーバーに AtomS3 自身を通知する（DNSリレー前提）  // RNDIS側は常に本機へ問い合わせ
+    log_append("DHCP DNS: %d.%d.%d.%d (AtomS3)",
+               ip4_addr1(&s_usb_ip.ip), ip4_addr2(&s_usb_ip.ip), ip4_addr3(&s_usb_ip.ip), ip4_addr4(&s_usb_ip.ip));
     esp_netif_dns_info_t dns_info = {};
-    IP4_ADDR(&dns_info.ip.u_addr.ip4, s_dns_ip[0], s_dns_ip[1], s_dns_ip[2], s_dns_ip[3]);
+    dns_info.ip.u_addr.ip4 = s_usb_ip.ip;
     dns_info.ip.type = ESP_IPADDR_TYPE_V4;
     esp_netif_set_dns_info(s_usb_netif, ESP_NETIF_DNS_MAIN, &dns_info);
 
@@ -1072,6 +1221,16 @@ void setup() {
     if (ret == ESP_OK) {
         M5.Display.println("DHCP server started");
         log_append("DHCP server: ready at 192.168.4.1");
+
+        // ─ DNS リレーサーバー設定 ─
+        // RNDIS側からのDNS問い合わせをWi-Fi側に転送するよう lwIP を設定
+        ip_addr_t upstream_dns;
+        IP_ADDR4(&upstream_dns, s_dns_ip[0], s_dns_ip[1], s_dns_ip[2], s_dns_ip[3]);
+        dns_setserver(0, &upstream_dns);
+        log_append("DNS relay: upstream DNS set to %d.%d.%d.%d",
+                   s_dns_ip[0], s_dns_ip[1], s_dns_ip[2], s_dns_ip[3]);
+        log_append("DNS relay: task deferred until RNDIS ready");
+    
     } else {
         M5.Display.println("DHCP server START FAILED");
         log_append("ERROR: DHCP server failed to start!");
@@ -1113,7 +1272,7 @@ void setup() {
     M5.Display.setTextColor(YELLOW);
     M5.Display.println("Waiting USB...");
     M5.Display.setTextColor(WHITE);
-    M5.Display.print("WAN: ");
+    M5.Display.print("WLAN: ");
     M5.Display.println(WiFi.localIP());
 }
 
