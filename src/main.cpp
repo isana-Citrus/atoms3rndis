@@ -1,15 +1,15 @@
 /*
  * AtomS3 RNDIS Host – Wi-Fi ルーター
  *
- * AtomS3 が USB ホストとして動作し、接続した RNDIS デバイス（brainnet 等）に
+ * AtomS3 が USB ホストとして動作し、接続した RNDIS Brainデバイスに
  * DHCP で IP を配布しつつ、WiFi 経由でインターネットに接続させる。
  *
- * LAN : USB RNDIS  – 192.168.37.1  (DHCP サーバ)
- * WAN : WiFi STA   – DHCP で動的 IP 取得
+ * LAN : USB RNDIS or USB NCM – 192.168.37.1  (DHCP サーバ)
+ * WLAN: WiFi STA             – DHCP で動的 IP 取得
  * NAT : ip_napt_enable で LAN→WAN を NAT
  *
  * 物理接続:
- *   AtomS3 USB-C → (USB-C to Micro-USB B ケーブル) → brainnet の Micro-USB 端子
+ *   AtomS3 USB-C → (USB-C to Micro-USB B ケーブル) → Brain の Micro-USB 端子
  */
 
 #include <M5Unified.h>
@@ -1542,9 +1542,9 @@ static esp_err_t usb_driver_post_attach(esp_netif_t *netif, void *args) {
 // WiFi側とIPアドレス体系が被るとうまく通信できない気がするので
 // 必要であれば編集が必要です
 static esp_netif_t *create_usb_netif(void) {
-    IP4_ADDR(&s_usb_ip.ip,      192, 168, 37, 1);
-    IP4_ADDR(&s_usb_ip.gw,      192, 168, 37, 1);
-    IP4_ADDR(&s_usb_ip.netmask, 255, 255, 255, 0);
+    IP4_ADDR(&s_usb_ip.ip,      192, 168, 37, 1);// USB 側の固定IPアドレス
+    IP4_ADDR(&s_usb_ip.gw,      192, 168, 37, 1);// ゲートウェイは自分自身なので基本上と同じで問題ないはず
+    IP4_ADDR(&s_usb_ip.netmask, 255, 255, 255, 0);// サブネットマスクも適切に設定。基本変えなくてよい
 
     esp_netif_inherent_config_t base = ESP_NETIF_INHERENT_DEFAULT_ETH();
     base.flags      = (esp_netif_flags_t)(ESP_NETIF_DHCP_SERVER | ESP_NETIF_FLAG_AUTOUP);
