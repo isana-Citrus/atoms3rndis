@@ -1,0 +1,4 @@
+.pio
+.vscode
+sdkconfig.m5stack-atoms3
+include/secret.h
