@@ -353,7 +353,7 @@ static void dns_relay_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(10));
             continue;
         }
-        s_dns_query_count++;
+        s_dns_query_count = s_dns_query_count + 1; // volatile への ++ は C++20 非推奨のため明示代入
 
         int upstream_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (upstream_sock < 0) {
@@ -390,7 +390,7 @@ static void dns_relay_task(void *arg) {
         int reply_len = recvfrom(upstream_sock, reply_buf, 1232, 0, nullptr, nullptr);
         close(upstream_sock);
         if (reply_len <= 0) {
-            s_dns_timeout_count++;
+            s_dns_timeout_count = s_dns_timeout_count + 1;
             if ((s_dns_timeout_count % 16) == 1) {
                 log_append("DNS relay: upstream timeout count=%u", (unsigned)s_dns_timeout_count);
             }
@@ -399,7 +399,7 @@ static void dns_relay_task(void *arg) {
 
         int sent_back = sendto(listen_sock, reply_buf, reply_len, 0, (sockaddr *)&client_addr, client_len);
         if (sent_back == reply_len) {
-            s_dns_reply_count++;
+            s_dns_reply_count = s_dns_reply_count + 1;
             if ((s_dns_reply_count % 16) == 1) {
                 log_append("DNS relay: ok q=%u r=%u t=%u",   // 問い合わせ/応答/タイムアウト統計
                            (unsigned)s_dns_query_count,
@@ -1881,7 +1881,7 @@ void loop() {
     M5.update(); // ボタン状態を更新 (現在は使用していないが将来の拡張用)
 
     // HTTP クライアントが接続していれば処理する (ブロッキングなし)
-    WiFiClient client = server.available();
+    WiFiClient client = server.accept(); // available() は非推奨、accept() を使う
     if (client) {
         handle_http_client(client); // ステータス・ログを HTML で返す
     }
