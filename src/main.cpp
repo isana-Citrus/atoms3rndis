@@ -12,6 +12,51 @@
  *   AtomS3 USB-C → (USB-C to Micro-USB B ケーブル) → Brain の Micro-USB 端子
  */
 
+/*
+ * ── 大まかなフロー ──────────────────────────────────────────────────────────
+ *
+ *  [setup()]
+ *   1. WiFi (WAN側) に接続し、上流 DNS アドレスを取得する
+ *   2. esp-netif で USB LAN インターフェース (192.168.37.1) を生成し
+ *      DHCP サーバを起動。DHCP でクライアントに DNS として自分自身を通知する
+ *   3. セマフォ・キュー・TX バッファを初期化する
+ *   4. USB ホストライブラリを起動する
+ *   5. 以下 3 タスクを起動する:
+ *        usb_host_lib_task  … USB ホスト低レベルイベントを処理するデーモン
+ *        rndis_client_task  … USB デバイスの接続/切断イベントを処理する
+ *        rndis_setup_task   … RNDIS/NCM ハンドシェイクと受信開始を行う
+ *
+ *  [デバイス接続時 (client_event_cb → rndis_setup_task)]
+ *   1. usb_host_device_open でデバイスを開く
+ *   2. parse_config_desc でディスクリプタを解析し、エンドポイントを特定する
+ *   3. クラスコードから RNDIS か CDC-NCM かリンクモードを判定する
+ *   4. 通信用・データ用インターフェースを Claim し、SET_INTERFACE を発行する
+ *   5. RNDIS_INITIALIZE / NCM_GET_NTB_PARAMETERS などの初期化メッセージを交換する
+ *   6. RNDIS の場合はパケットフィルタを設定する
+ *   7. Bulk IN (受信) と Interrupt IN (状態通知) の受信を開始する
+ *   8. esp-netif を "接続済み" 状態に遷移させ、ip_napt で NAT を有効化する
+ *   9. DNS リレータスクを初回のみ起動する
+ *
+ *  [データ受信フロー (rx_callback)]
+ *   RNDIS モード  : RNDIS パケットヘッダ (44 バイト) を除去 → deliver_rx_frame
+ *   CDC-NCM モード: NTB16 ブロックをパースして各イーサネットフレームを取り出す
+ *                   → deliver_rx_frame
+ *   deliver_rx_frame → esp_netif_receive → lwIP スタック → DHCP/DNS/NAT 処理
+ *
+ *  [データ送信フロー (usb_driver_transmit)]
+ *   lwIP → esp_netif 送信コールバック → usb_driver_transmit
+ *   RNDIS モード  : RNDIS パケットヘッダを先頭に付けて Bulk OUT 転送
+ *   CDC-NCM モード: NTB16 ヘッダ・NDP16 を構築してデータグラムを格納し Bulk OUT 転送
+ *
+ *  [DNS リレー (dns_relay_task)]
+ *   UDP ポート 53 で listen → クライアントの DNS クエリを Wi-Fi 側の上流 DNS へ転送
+ *   → 上流から返答を受け取りクライアントへ返す
+ *
+ *  [loop()]
+ *   HTTP クライアントが接続してきたら handle_http_client でステータスとログを
+ *   HTML ページとして返す（2 秒ごとに自動リロード）
+ */
+
 #include <M5Unified.h>
 #include <WiFi.h>
 #include <WiFiServer.h>
@@ -35,101 +80,116 @@
 #include "freertos/queue.h"
 
 // ─── RNDIS メッセージ型 ───────────────────────────────────────────────────────
-#define RNDIS_PACKET_MSG        0x00000001u
-#define RNDIS_INITIALIZE_MSG    0x00000002u
-#define RNDIS_QUERY_MSG         0x00000004u
-#define RNDIS_SET_MSG           0x00000005u
-#define RNDIS_INITIALIZE_CMPLT  0x80000002u
-#define RNDIS_QUERY_CMPLT       0x80000004u
-#define RNDIS_SET_CMPLT         0x80000005u
-#define RNDIS_STATUS_SUCCESS    0x00000000u
+// ホスト→デバイス方向のコントロールメッセージ種別
+#define RNDIS_PACKET_MSG        0x00000001u  // イーサネットフレームを運ぶデータパケット
+#define RNDIS_INITIALIZE_MSG    0x00000002u  // 初期化要求（ホストからデバイスへ）
+#define RNDIS_QUERY_MSG         0x00000004u  // OID 情報取得要求
+#define RNDIS_SET_MSG           0x00000005u  // OID 情報設定要求
+// デバイス→ホスト方向の応答メッセージ種別 (上位ビット=1)
+#define RNDIS_INITIALIZE_CMPLT  0x80000002u  // 初期化完了応答
+#define RNDIS_QUERY_CMPLT       0x80000004u  // OID 取得完了応答
+#define RNDIS_SET_CMPLT         0x80000005u  // OID 設定完了応答
+#define RNDIS_STATUS_SUCCESS    0x00000000u  // 処理成功を示すステータス値
 
-// OID
-#define OID_GEN_SUPPORTED_LIST          0x00010101u
-#define OID_GEN_HARDWARE_STATUS         0x00010102u
-#define OID_GEN_MEDIA_SUPPORTED         0x00010103u
-#define OID_GEN_MEDIA_IN_USE            0x00010104u
-#define OID_GEN_MAXIMUM_FRAME_SIZE      0x00010106u
-#define OID_GEN_MAXIMUM_TOTAL_SIZE      0x00010111u
-#define OID_802_3_PERMANENT_ADDRESS     0x01010101u
-#define OID_GEN_CURRENT_PACKET_FILTER   0x0001010Eu
-#define NDIS_PACKET_FILTER_ALL          0x0000000Fu
+// OID (Object Identifier) – NDIS デバイスの属性・設定を表す識別子
+#define OID_GEN_SUPPORTED_LIST          0x00010101u  // サポートする OID 一覧
+#define OID_GEN_HARDWARE_STATUS         0x00010102u  // ハードウェア状態
+#define OID_GEN_MEDIA_SUPPORTED         0x00010103u  // サポートするメディア種別
+#define OID_GEN_MEDIA_IN_USE            0x00010104u  // 現在使用中のメディア種別
+#define OID_GEN_MAXIMUM_FRAME_SIZE      0x00010106u  // 最大フレームサイズ
+#define OID_GEN_MAXIMUM_TOTAL_SIZE      0x00010111u  // 最大転送サイズ
+#define OID_802_3_PERMANENT_ADDRESS     0x01010101u  // デバイスの MAC アドレス取得
+#define OID_GEN_CURRENT_PACKET_FILTER   0x0001010Eu  // パケットフィルタ設定
+#define NDIS_PACKET_FILTER_ALL          0x0000000Fu  // すべてのパケットを受信するフィルタ値
 
 // ─── RNDIS メッセージ構造体 ─────────────────────────────────────────────────
+// USB コントロール転送で送受信するバイナリメッセージのレイアウトを定義する
+// #pragma pack(push, 1) でパディングを除去し、仕様通りのオフセットを保証する
 
 #pragma pack(push, 1)
 
+// RNDIS 初期化要求メッセージ (ホスト → デバイス)
 typedef struct {
-    uint32_t MessageType, MessageLength, RequestId;
-    uint32_t MajorVersion, MinorVersion, MaxTransferSize;
+    uint32_t MessageType, MessageLength, RequestId;   // 共通ヘッダ: メッセージ種別・長さ・要求ID
+    uint32_t MajorVersion, MinorVersion, MaxTransferSize; // RNDIS バージョンと最大転送サイズ
 } rndis_init_msg_t;
 
+// RNDIS 初期化完了応答 (デバイス → ホスト)
 typedef struct {
-    uint32_t MessageType, MessageLength, RequestId, Status;
-    uint32_t MajorVersion, MinorVersion, DeviceFlags, Medium;
-    uint32_t MaxPacketsPerTransfer, MaxTransferSize, PacketAlignmentFactor;
-    uint32_t AFListOffset, AFListSize;
+    uint32_t MessageType, MessageLength, RequestId, Status; // 共通ヘッダ + 結果ステータス
+    uint32_t MajorVersion, MinorVersion, DeviceFlags, Medium; // デバイス属性
+    uint32_t MaxPacketsPerTransfer, MaxTransferSize, PacketAlignmentFactor; // 転送パラメータ
+    uint32_t AFListOffset, AFListSize;  // 追加フィルタリスト (通常 0)
 } rndis_init_cmplt_t;
 
+// OID 情報取得要求 (ホスト → デバイス)
 typedef struct {
-    uint32_t MessageType, MessageLength, RequestId, Oid;
+    uint32_t MessageType, MessageLength, RequestId, Oid; // 取得する OID を指定
     uint32_t InformationBufferLength, InformationBufferOffset, Reserved;
 } rndis_query_msg_t;
 
+// OID 情報取得完了応答 (デバイス → ホスト)
 typedef struct {
     uint32_t MessageType, MessageLength, RequestId, Status;
-    uint32_t InformationBufferLength, InformationBufferOffset;
+    uint32_t InformationBufferLength, InformationBufferOffset; // データのオフセットと長さ
 } rndis_query_cmplt_t;
 
+// OID 情報設定要求 (ホスト → デバイス)
 typedef struct {
     uint32_t MessageType, MessageLength, RequestId, Oid;
     uint32_t InformationBufferLength, InformationBufferOffset, Reserved;
 } rndis_set_msg_t;
 
+// OID 情報設定完了応答 (デバイス → ホスト)
 typedef struct {
     uint32_t MessageType, MessageLength, RequestId, Status;
 } rndis_set_cmplt_t;
 
+// RNDIS データパケットヘッダ – イーサネットフレームをラップする
 typedef struct {
-    uint32_t MessageType, MessageLength;
-    uint32_t DataOffset, DataLength;
-    uint32_t OOBDataOffset, OOBDataLength, NumOOBDataElements;
-    uint32_t PerPacketInfoOffset, PerPacketInfoLength;
+    uint32_t MessageType, MessageLength; // 0x00000001 固定 / ヘッダ+ペイロード合計長
+    uint32_t DataOffset, DataLength;     // ペイロード先頭オフセット(RequestId基準) と長さ
+    uint32_t OOBDataOffset, OOBDataLength, NumOOBDataElements; // Out-of-band データ (通常 0)
+    uint32_t PerPacketInfoOffset, PerPacketInfoLength; // パーパケット情報 (通常 0)
     uint32_t VcHandle, Reserved;
 } rndis_packet_msg_t;
 
+// CDC-NCM NTB (Network Transfer Block) パラメータ – GET_NTB_PARAMETERS で取得
 typedef struct {
-    uint16_t wLength;
-    uint16_t bmNtbFormatsSupported;
-    uint32_t dwNtbInMaxSize;
-    uint16_t wNdpInDivisor;
-    uint16_t wNdpInPayloadRemainder;
-    uint16_t wNdpInAlignment;
+    uint16_t wLength;                   // この構造体のサイズ
+    uint16_t bmNtbFormatsSupported;     // ビット0=NTB16対応, ビット1=NTB32対応
+    uint32_t dwNtbInMaxSize;            // デバイス → ホスト方向の最大 NTB サイズ
+    uint16_t wNdpInDivisor;             // ペイロードアライメント除数 (IN)
+    uint16_t wNdpInPayloadRemainder;    // ペイロードアライメント余り (IN)
+    uint16_t wNdpInAlignment;           // NDP 先頭のアライメント (IN)
     uint16_t reserved0;
-    uint32_t dwNtbOutMaxSize;
-    uint16_t wNdpOutDivisor;
-    uint16_t wNdpOutPayloadRemainder;
-    uint16_t wNdpOutAlignment;
+    uint32_t dwNtbOutMaxSize;           // ホスト → デバイス方向の最大 NTB サイズ
+    uint16_t wNdpOutDivisor;            // ペイロードアライメント除数 (OUT)
+    uint16_t wNdpOutPayloadRemainder;   // ペイロードアライメント余り (OUT)
+    uint16_t wNdpOutAlignment;          // NDP 先頭のアライメント (OUT)
     uint16_t reserved1;
 } cdc_ncm_ntb_parameters_t;
 
+// CDC-NCM NTB16 ヘッダ – NTB ブロック先頭に配置される固定ヘッダ
 typedef struct {
-    uint32_t dwSignature;
-    uint16_t wHeaderLength;
-    uint16_t wSequence;
-    uint16_t wBlockLength;
-    uint16_t wNdpIndex;
+    uint32_t dwSignature;   // 0x484D434E ("NCMH") で正当性を確認
+    uint16_t wHeaderLength; // このヘッダのバイト数
+    uint16_t wSequence;     // シーケンス番号 (デバッグ用)
+    uint16_t wBlockLength;  // NTB 全体のバイト数
+    uint16_t wNdpIndex;     // 最初の NDP16 へのオフセット
 } cdc_ncm_nth16_t;
 
+// CDC-NCM NDP16 ヘッダ – データグラムポインタテーブルのヘッダ
 typedef struct {
-    uint32_t dwSignature;
-    uint16_t wLength;
-    uint16_t wNextNdpIndex;
+    uint32_t dwSignature;    // 0x304D434E ("NCM0") で正当性を確認
+    uint16_t wLength;        // NDP ヘッダ + DPE 配列の合計バイト数
+    uint16_t wNextNdpIndex;  // 次の NDP16 へのオフセット (0 = 終端)
 } cdc_ncm_ndp16_t;
 
+// CDC-NCM DPE16 – 各データグラム (イーサネットフレーム) の位置と長さ
 typedef struct {
-    uint16_t wDatagramIndex;
-    uint16_t wDatagramLength;
+    uint16_t wDatagramIndex;  // NTB 先頭からのフレーム開始オフセット
+    uint16_t wDatagramLength; // フレームのバイト数 (0 = 終端エントリ)
 } cdc_ncm_dpe16_t;
 
 #pragma pack(pop)
@@ -146,19 +206,19 @@ typedef struct {
 
 // ─── グローバル状態 ───────────────────────────────────────────────────────────
 
-static WiFiServer server(80);
-static IPAddress s_local_ip;
-static bool s_wifi_connected = false;
-static bool s_http_rndis_only = true;
-static IPAddress s_upstream_dns_ip;
-static volatile uint32_t s_dns_query_count = 0;
-static volatile uint32_t s_dns_reply_count = 0;
-static volatile uint32_t s_dns_timeout_count = 0;
-static bool s_dns_task_started = false;
-static usb_transfer_status_t s_last_ctrl_status = USB_TRANSFER_STATUS_COMPLETED;
-static uint8_t s_ctrl_out_bm_request_type = 0x21;
-static uint8_t s_ctrl_in_bm_request_type  = 0xA1;
-static uint16_t s_ctrl_w_index = 0;
+static WiFiServer server(80);          // HTTP 管理画面サーバ (ポート 80)
+static IPAddress s_local_ip;           // WiFi 側で取得したローカル IP
+static bool s_wifi_connected = false;  // WiFi 接続状態フラグ
+static bool s_http_rndis_only = true;  // HTTP アクセスを RNDIS サブネットのみに制限するか
+static IPAddress s_upstream_dns_ip;    // WiFi から取得した上流 DNS サーバ IP
+static volatile uint32_t s_dns_query_count = 0;    // DNS リレー: クエリ受信回数
+static volatile uint32_t s_dns_reply_count = 0;    // DNS リレー: 応答返送回数
+static volatile uint32_t s_dns_timeout_count = 0;  // DNS リレー: 上流タイムアウト回数
+static bool s_dns_task_started = false;             // DNS リレータスクが起動済みかフラグ
+static usb_transfer_status_t s_last_ctrl_status = USB_TRANSFER_STATUS_COMPLETED; // 直前のコントロール転送結果
+static uint8_t s_ctrl_out_bm_request_type = 0x21;  // コントロール OUT の bmRequestType (動的に変更)
+static uint8_t s_ctrl_in_bm_request_type  = 0xA1;  // コントロール IN の bmRequestType (動的に変更)
+static uint16_t s_ctrl_w_index = 0;                 // コントロール転送の wIndex (インターフェース番号)
 
 // ログバッファ
 #define LOG_SIZE 8192
@@ -174,69 +234,76 @@ static void log_append(const char *fmt, ...) {
     s_log_pos += snprintf(s_log_buffer + s_log_pos, LOG_SIZE - s_log_pos, "\n");
 }
 
-static usb_host_client_handle_t s_client_hdl = NULL;
-static usb_device_handle_t      s_dev_hdl    = NULL;
-static uint8_t  s_comm_itf_num = 0xFF;  // CDC Comm interface
-static uint8_t  s_data_itf_num = 0xFF;  // CDC Data interface
-static uint8_t  s_comm_itf_alt = 0;     // CDC Comm alternate setting
-static uint8_t  s_data_itf_alt = 0;     // CDC Data alternate setting
-static uint8_t  s_ep_out       = 0;
-static uint8_t  s_ep_in        = 0;
-static uint16_t s_ep_out_mps   = 0;
-static uint16_t s_ep_in_mps    = 0;
-static uint32_t s_req_id       = 1;
-static uint8_t  s_comm_class   = 0;
-static uint8_t  s_comm_subclass= 0;
-static uint8_t  s_comm_proto   = 0;
-static uint8_t  s_data_class   = 0;
-static uint8_t  s_data_subclass= 0;
-static uint8_t  s_data_proto   = 0;
-static cdc_ncm_ntb_parameters_t s_ncm_params = {};
-static uint16_t s_ncm_tx_sequence = 0;
-static uint32_t s_rx_buf_size = BULK_BUF_SIZE;
+static usb_host_client_handle_t s_client_hdl = NULL; // USB ホストクライアントハンドル
+static usb_device_handle_t      s_dev_hdl    = NULL; // 接続中デバイスのハンドル
+static uint8_t  s_comm_itf_num = 0xFF;  // コントロール用インターフェース番号 (0xFF=未検出)
+static uint8_t  s_data_itf_num = 0xFF;  // データ用インターフェース番号 (0xFF=未検出)
+static uint8_t  s_comm_itf_alt = 0;     // コントロールインターフェースの Alternate Setting
+static uint8_t  s_data_itf_alt = 0;     // データインターフェースの Alternate Setting
+static uint8_t  s_ep_out       = 0;     // Bulk OUT エンドポイントアドレス
+static uint8_t  s_ep_in        = 0;     // Bulk IN エンドポイントアドレス
+static uint16_t s_ep_out_mps   = 0;     // Bulk OUT の最大パケットサイズ
+static uint16_t s_ep_in_mps    = 0;     // Bulk IN の最大パケットサイズ
+static uint32_t s_req_id       = 1;     // RNDIS メッセージの要求ID (送るたびにインクリメント)
+static uint8_t  s_comm_class   = 0;     // コントロールインターフェースのクラスコード
+static uint8_t  s_comm_subclass= 0;     // コントロールインターフェースのサブクラスコード
+static uint8_t  s_comm_proto   = 0;     // コントロールインターフェースのプロトコルコード
+static uint8_t  s_data_class   = 0;     // データインターフェースのクラスコード
+static uint8_t  s_data_subclass= 0;     // データインターフェースのサブクラスコード
+static uint8_t  s_data_proto   = 0;     // データインターフェースのプロトコルコード
+static cdc_ncm_ntb_parameters_t s_ncm_params = {}; // CDC-NCM 用の NTB パラメータ
+static uint16_t s_ncm_tx_sequence = 0;  // CDC-NCM 送信 NTB のシーケンス番号
+static uint32_t s_rx_buf_size = BULK_BUF_SIZE; // Bulk IN 受信バッファサイズ
 
+// USB リンクモード – デバイスのディスクリプタ解析後に決定される
 typedef enum {
-    USB_LINK_MODE_RNDIS,
-    USB_LINK_MODE_CDC_NCM,
+    USB_LINK_MODE_RNDIS,    // Windows RNDIS プロトコル (Brain のデフォルト)
+    USB_LINK_MODE_CDC_NCM,  // CDC NCM プロトコル (brainux 等の Linux 系カーネル)
 } usb_link_mode_t;
-static usb_link_mode_t s_link_mode = USB_LINK_MODE_RNDIS;
+static usb_link_mode_t s_link_mode = USB_LINK_MODE_RNDIS; // 接続時に自動判定
 
-static esp_netif_t *s_usb_netif = nullptr;
-static esp_netif_ip_info_t s_usb_ip;
+static esp_netif_t *s_usb_netif = nullptr;   // USB LAN 側の esp-netif インスタンス
+static esp_netif_ip_info_t s_usb_ip;         // USB LAN 側の固定 IP 情報 (192.168.37.1)
 
 // lwIP タスクコンテキストで NAPT を有効化するコールバック
+// esp_netif_tcpip_exec 経由で呼ぶことで lwIP 内部から安全にNAPTを設定できる
 static esp_err_t enable_napt_cb(void *) {
-    ip_napt_enable(s_usb_ip.ip.addr, 1);
+    ip_napt_enable(s_usb_ip.ip.addr, 1); // USB LAN インターフェースで NAT を有効化
     return ESP_OK;
 }
 
+// RNDIS/NCM 接続状態マシン
 typedef enum {
-    RNDIS_STATE_IDLE,
-    RNDIS_STATE_CONNECTED,
-    RNDIS_STATE_INITIALIZED,
-    RNDIS_STATE_READY,
-    RNDIS_STATE_ERROR,
+    RNDIS_STATE_IDLE,        // デバイス未接続
+    RNDIS_STATE_CONNECTED,   // デバイスを開いてインターフェースを Claim した状態
+    RNDIS_STATE_INITIALIZED, // RNDIS/NCM 初期化メッセージ交換完了
+    RNDIS_STATE_READY,       // Bulk IN 受信中・データ転送可能な状態
+    RNDIS_STATE_ERROR,       // 初期化失敗
 } rndis_state_t;
 static volatile rndis_state_t s_rndis_state = RNDIS_STATE_IDLE;
 
-// コントロール転送完了通知用セマフォ
+// コントロール転送完了通知用セマフォ (コントロール転送はコールバックで完了を通知)
 static SemaphoreHandle_t s_ctrl_sem = NULL;
-// TX 完了通知用セマフォ
+// TX 完了通知用セマフォ (1パケットずつ直列送信のため完了まで次を待つ)
 static SemaphoreHandle_t s_tx_sem   = NULL;
 // Bulk IN/OUT 転送バッファ
-static usb_transfer_t *s_rx_xfer = NULL;
-static usb_transfer_t *s_tx_xfer = NULL;
+static usb_transfer_t *s_rx_xfer = NULL; // Bulk IN 受信用の転送オブジェクト
+static usb_transfer_t *s_tx_xfer = NULL; // Bulk OUT 送信用の転送オブジェクト
 // Interrupt IN 転送バッファ（RNDIS 状態通知）
 static usb_transfer_t *s_intr_xfer = NULL;
-static uint8_t s_ep_intr = 0;  // Interrupt IN エンドポイント
+static uint8_t s_ep_intr = 0;  // Interrupt IN エンドポイントアドレス
 // デバイス接続通知キュー（アドレスを event callback → setup task に渡す）
 static QueueHandle_t s_dev_queue = NULL;
 
+// ─── DNS リレータスク ────────────────────────────────────────────────────────
+// RNDIS クライアントから UDP/53 に届いた DNS クエリを Wi-Fi 側の上流 DNS へ転送し、
+// 返答を元のクライアントへ返すシンプルなリレー。
+// NAT だけでも動く場合があるが、RNDIS デバイスが AtomS3 を DNS と認識している場合に必要。
 static void dns_relay_task(void *arg) {
     (void)arg;
 
     const int kDnsPort = 53;
-    uint8_t *query_buf = (uint8_t *)malloc(1232);
+    uint8_t *query_buf = (uint8_t *)malloc(1232); // RFC 5625 推奨の DNS メッセージ最大サイズ
     uint8_t *reply_buf = (uint8_t *)malloc(1232);
     if (!query_buf || !reply_buf) {
         log_append("DNS relay: buffer alloc failed");
@@ -246,7 +313,7 @@ static void dns_relay_task(void *arg) {
         return;
     }
 
-    int listen_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    int listen_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP); // クライアント受信用 UDP ソケット
     if (listen_sock < 0) {
         log_append("DNS relay: socket create failed");
         free(query_buf);
@@ -258,7 +325,8 @@ static void dns_relay_task(void *arg) {
     sockaddr_in listen_addr = {};
     listen_addr.sin_family = AF_INET;
     listen_addr.sin_port = htons(kDnsPort);
-    listen_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    //listen_addr.sin_addr.s_addr = htonl(INADDR_ANY); // 全インターフェースで待ち受け
+    listen_addr.sin_addr.s_addr = s_usb_ip.ip.addr; // USB LAN インターフェースで待ち受け
     if (bind(listen_sock, (sockaddr *)&listen_addr, sizeof(listen_addr)) < 0) {
         log_append("DNS relay: bind UDP/53 failed");
         close(listen_sock);
@@ -346,16 +414,20 @@ static void dns_relay_task(void *arg) {
 
 // ─── コントロール転送ヘルパー ─────────────────────────────────────────────────
 
+// コントロール転送完了コールバック – USB ホストデーモンタスクから呼ばれる
 static void ctrl_xfer_cb(usb_transfer_t *xfer) {
-    // USB host daemon task から呼ばれる（ISR ではない）
-    xSemaphoreGive(s_ctrl_sem);
+    // ISR ではないので xSemaphoreGive を直接呼んでよい
+    xSemaphoreGive(s_ctrl_sem); // 待機中のタスクに転送完了を通知
 }
 
+// value を alignment の倍数に切り上げる (CDC-NCM NDP アライメント計算用)
 static uint16_t align_up_u16(uint16_t value, uint16_t alignment) {
     if (alignment <= 1) return value;
     return (uint16_t)(((value + alignment - 1) / alignment) * alignment);
 }
 
+// CDC-NCM ペイロードを (value % divisor == remainder) の条件でアライメントする
+// CDC-NCM 仕様 Table 6.3 の NDP ペイロード配置ルールに従う
 static uint16_t align_ncm_payload_u16(uint16_t value, uint16_t divisor, uint16_t remainder) {
     if (divisor == 0) return value;
     uint16_t mod = (uint16_t)(value % divisor);
@@ -364,6 +436,8 @@ static uint16_t align_ncm_payload_u16(uint16_t value, uint16_t divisor, uint16_t
     return (uint16_t)(value + (divisor - mod + remainder));
 }
 
+// USB 標準リクエスト SET_INTERFACE – CDC Data インターフェースの Alternate Setting を切り替える
+// CDC-NCM では Alternate Setting 1 でバルクエンドポイントが有効になるため必要
 static esp_err_t std_set_interface(uint8_t itf_num, uint8_t alt_setting) {
     usb_transfer_t *xfer = NULL;
     esp_err_t ret = usb_host_transfer_alloc(sizeof(usb_setup_packet_t), 0, &xfer);
@@ -410,6 +484,7 @@ static esp_err_t std_set_interface(uint8_t itf_num, uint8_t alt_setting) {
     return ret;
 }
 
+// USB コントロール転送 (OUT方向) の低レベル実装 – bmRequestType と wIndex を直接指定
 static esp_err_t ctrl_out_raw(uint8_t bRequest, uint8_t bmRequestType, uint16_t wIndex,
                               const void *data, uint16_t len) {
     usb_transfer_t *xfer = NULL;
@@ -473,28 +548,31 @@ static esp_err_t ctrl_out_try(uint8_t bRequest, uint8_t bmRequestType, uint16_t 
     return ret;
 }
 
+// RNDIS/NCM コントロール OUT の上位ラッパー – STALL 時に複数の宛先を順番に試行する
+// デバイスによって wIndex やレシピエントが異なるため、複数パターンをフォールバック送信する
 static esp_err_t ctrl_out(uint8_t bRequest, const void *data, uint16_t len) {
-    esp_err_t ret = ctrl_out_try(bRequest, 0x21, s_comm_itf_num, data, len, "comm-interface");
+    esp_err_t ret = ctrl_out_try(bRequest, 0x21, s_comm_itf_num, data, len, "comm-interface"); // 通常はここで成功
     if (ret == ESP_OK) return ESP_OK;
     if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL &&
         s_data_itf_num != 0xFF && s_data_itf_num != s_comm_itf_num) {
-        ret = ctrl_out_try(bRequest, 0x21, s_data_itf_num, data, len, "data-interface");
+        ret = ctrl_out_try(bRequest, 0x21, s_data_itf_num, data, len, "data-interface"); // データインターフェースで再試行
         if (ret == ESP_OK || s_last_ctrl_status != USB_TRANSFER_STATUS_STALL) return ret;
     }
     if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL && s_comm_itf_num != 0) {
-        ret = ctrl_out_try(bRequest, 0x21, 0, data, len, "interface-zero");
+        ret = ctrl_out_try(bRequest, 0x21, 0, data, len, "interface-zero"); // インターフェース 0 で再試行
         if (ret == ESP_OK || s_last_ctrl_status != USB_TRANSFER_STATUS_STALL) return ret;
     }
     if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL) {
-        ret = ctrl_out_try(bRequest, 0x20, s_comm_itf_num, data, len, "device-recipient");
+        ret = ctrl_out_try(bRequest, 0x20, s_comm_itf_num, data, len, "device-recipient"); // デバイスレシピエントで再試行
         if (ret == ESP_OK || s_last_ctrl_status != USB_TRANSFER_STATUS_STALL) return ret;
     }
     if (s_last_ctrl_status == USB_TRANSFER_STATUS_STALL && s_comm_itf_num != 0) {
-        ret = ctrl_out_try(bRequest, 0x20, 0, data, len, "device-recipient-zero");
+        ret = ctrl_out_try(bRequest, 0x20, 0, data, len, "device-recipient-zero"); // 最終フォールバック
     }
     return ret;
 }
 
+// USB コントロール転送 (IN方向) の低レベル実装 – デバイスからデータを受信する
 static esp_err_t ctrl_in_raw(uint8_t bRequest, uint8_t bmRequestType, uint16_t wIndex, void *buf,
                              uint16_t buf_len, uint16_t *actual_len) {
     usb_transfer_t *xfer = NULL;
@@ -579,9 +657,11 @@ static esp_err_t ctrl_in(uint8_t bRequest, void *buf, uint16_t buf_len,
 
 // ─── ディスクリプタ解析 ──────────────────────────────────────────────────────
 //
-// クラスコードに依存せず、エンドポイントの種類でインターフェースを識別する:
-//   Interrupt IN あり → RNDIS コントロールインターフェース
-//   Bulk IN + Bulk OUT → RNDIS データインターフェース
+// USB Configuration Descriptor を先頭から順に走査してインターフェースとエンドポイントを特定する。
+// クラスコードを優先しつつ、不明な場合はエンドポイント種別で推測する:
+//   Interrupt IN あり → RNDIS/CDC コントロールインターフェース候補
+//   Bulk IN + Bulk OUT → RNDIS/NCM データインターフェース候補
+// 複数候補がある場合はスコアが高い方を採用する (RNDIS > CDC Comm > Interrupt IN のみ)
 
 static bool parse_config_desc(void) {
     const usb_config_desc_t *cfg = NULL;
@@ -727,9 +807,12 @@ static bool parse_config_desc(void) {
     return (s_data_itf_num != 0xFF && s_ep_in != 0 && s_ep_out != 0);
 }
 
+// CDC-NCM 初期化シーケンス
+// GET_NTB_PARAMETERS でデバイスの NTB 最大サイズ・アライメント情報を取得し、
+// SET_NTB_FORMAT / SET_NTB_INPUT_SIZE でホスト側のパラメータをデバイスに通知する
 static bool cdc_ncm_initialize(void) {
-    s_ctrl_out_bm_request_type = 0x21;
-    s_ctrl_in_bm_request_type = 0xA1;
+    s_ctrl_out_bm_request_type = 0x21; // Class, Interface, Host→Device
+    s_ctrl_in_bm_request_type = 0xA1;  // Class, Interface, Device→Host
     s_ctrl_w_index = s_comm_itf_num;
 
     memset(&s_ncm_params, 0, sizeof(s_ncm_params));
@@ -782,6 +865,8 @@ static bool cdc_ncm_initialize(void) {
 
 // ─── RNDIS ハンドシェイク ─────────────────────────────────────────────────────
 
+// RNDIS 初期化シーケンス Step 1: INITIALIZE_MSG を送り INITIALIZE_CMPLT を受け取る
+// 成功するとデバイスが RNDIS プロトコルを認識した状態になる
 static bool rndis_initialize(void) {
     rndis_init_msg_t msg = {};
     msg.MessageType     = RNDIS_INITIALIZE_MSG;
@@ -806,6 +891,7 @@ static bool rndis_initialize(void) {
     return ok;
 }
 
+// RNDIS OID_802_3_PERMANENT_ADDRESS クエリ – デバイスの MAC アドレスを取得する
 static bool rndis_query_mac(uint8_t mac_out[6]) {
     rndis_query_msg_t msg = {};
     msg.MessageType = RNDIS_QUERY_MSG;
@@ -840,6 +926,8 @@ static bool rndis_query_mac(uint8_t mac_out[6]) {
     return true;
 }
 
+// RNDIS OID_GEN_CURRENT_PACKET_FILTER 設定 – すべてのパケットを受信するフィルタを有効化する
+// これを設定しないとデバイスがパケットを送ってこない
 static bool rndis_set_filter(void) {
     uint8_t buf[sizeof(rndis_set_msg_t) + 4] = {};
     rndis_set_msg_t *msg = (rndis_set_msg_t *)buf;
@@ -906,13 +994,15 @@ static bool rndis_query_oid(uint32_t oid, void *buf_out, uint16_t buf_len) {
 
 // ─── Bulk IN/OUT コールバック ─────────────────────────────────────────────────
 
-static uint32_t s_rx_count = 0;
-static uint32_t s_rx_bytes = 0;
-static uint32_t s_rx_frame_count = 0;
-static uint32_t s_rx_ipv4_count = 0;
-static uint32_t s_rx_ipv6_count = 0;
-static uint32_t s_rx_arp_count = 0;
+// デバッグ用の受信統計カウンタ
+static uint32_t s_rx_count = 0;       // Bulk IN 転送完了回数
+static uint32_t s_rx_bytes = 0;       // 受信合計バイト数
+static uint32_t s_rx_frame_count = 0; // deliver_rx_frame に渡したフレーム数
+static uint32_t s_rx_ipv4_count = 0;  // 受信した IPv4 フレーム数
+static uint32_t s_rx_ipv6_count = 0;  // 受信した IPv6 フレーム数
+static uint32_t s_rx_arp_count = 0;   // 受信した ARP フレーム数
 
+// イーサネットフレームから IPv4/UDP の送受信ポート番号を取得する (ログ用)
 static bool parse_ipv4_udp_ports(const uint8_t *frame, size_t len, uint16_t *src_port, uint16_t *dst_port) {
     if (!frame || len < 14 + 20 + 8) return false;
     uint16_t ether_type = ((uint16_t)frame[12] << 8) | frame[13];
@@ -934,6 +1024,7 @@ static bool parse_ipv4_udp_ports(const uint8_t *frame, size_t len, uint16_t *src
     return true;
 }
 
+// イーサネットフレームから ICMPv6 タイプを取得する (RS/RA/NS/NA のログ用)
 static bool parse_ipv6_icmp_type(const uint8_t *frame, size_t len, uint8_t *icmpv6_type) {
     if (!frame || len < 14 + 40 + 1) return false;
     uint16_t ether_type = ((uint16_t)frame[12] << 8) | frame[13];
@@ -949,6 +1040,8 @@ static bool parse_ipv6_icmp_type(const uint8_t *frame, size_t len, uint8_t *icmp
     return true;
 }
 
+// RNDIS/NCM から取り出したイーサネットフレームを lwIP スタックへ注入する
+// esp_netif_receive に渡すバッファは heap 確保済みで、lwIP が free コールバックで解放する
 static void deliver_rx_frame(const uint8_t *frame, size_t len) {
     if (!frame || len == 0 || !s_usb_netif) return;
 
@@ -1007,6 +1100,8 @@ static void deliver_rx_frame(const uint8_t *frame, size_t len) {
     }
 }
 
+// Bulk IN 転送完了コールバック – RNDIS または NCM フレームを解析して deliver_rx_frame へ渡す
+// 処理後は次の Bulk IN 転送を再投入してループを維持する
 static void rx_callback(usb_transfer_t *xfer) {
     if (xfer->status == USB_TRANSFER_STATUS_COMPLETED) {
         s_rx_bytes += xfer->actual_num_bytes;
@@ -1080,8 +1175,9 @@ static void rx_callback(usb_transfer_t *xfer) {
     }
 }
 
+// Bulk OUT 転送完了コールバック – 送信完了を s_tx_sem で通知して次の送信を許可する
 static void tx_callback(usb_transfer_t *xfer) {
-    xSemaphoreGive(s_tx_sem);
+    xSemaphoreGive(s_tx_sem); // usb_driver_transmit の xSemaphoreTake と対になる
 }
 
 static void intr_callback(usb_transfer_t *xfer) {
@@ -1109,6 +1205,7 @@ static void start_intr(void) {
     log_append("INTR submit: ret=%d ep=0x%02X", ret, s_ep_intr);
 }
 
+// Bulk IN 受信を開始する – 必要なら転送バッファを再確保してから投入する
 static void start_rx(void) {
     if (s_rx_xfer == NULL || s_rx_xfer->num_bytes < (int)s_rx_buf_size) {
         if (s_rx_xfer != NULL) {
@@ -1230,7 +1327,8 @@ static void cleanup_rndis_device(bool from_disconnect) {
 }
 
 // ─── RNDIS セットアップタスク（event callback とは別タスクで実行） ────────────
-
+// client_event_cb でのブロッキング処理を避けるため、デバイスアドレスをキューで受け取り
+// このタスク内でデバイスオープン〜RNDIS/NCM 初期化〜受信開始を順番に実行する
 static void rndis_setup_task(void *arg) {
     uint8_t dev_addr;
     for (;;) {
@@ -1388,7 +1486,8 @@ static void rndis_setup_task(void *arg) {
 }
 
 // ─── USB クライアントイベントコールバック ─────────────────────────────────────
-
+// rndis_client_task (usb_host_client_handle_events) から呼ばれるイベントハンドラ
+// ブロッキング処理はここで行わず、キューに渡して rndis_setup_task に委譲する
 static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg) {
     if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
         M5.Display.println("Dev connected");
@@ -1409,15 +1508,17 @@ static void client_event_cb(const usb_host_client_event_msg_t *msg, void *arg) {
 
 // ─── USB ホスト / クライアントタスク ─────────────────────────────────────────
 
+// USB ホストライブラリの低レベルイベントループ – 最高優先度で動かしてハードウェアイベントを処理する
 static void usb_host_lib_task(void *arg) {
     for (;;) {
         uint32_t flags;
-        usb_host_lib_handle_events(portMAX_DELAY, &flags);
+        usb_host_lib_handle_events(portMAX_DELAY, &flags); // USB ホストライブラリのイベント処理
         if (flags & USB_HOST_LIB_EVENT_FLAGS_NO_CLIENTS)
-            usb_host_device_free_all();
+            usb_host_device_free_all(); // クライアントが全員いなくなったらデバイスを解放
     }
 }
 
+// USB クライアントのイベントループ – client_event_cb を呼び出すポンプ
 static void rndis_client_task(void *arg) {
     const usb_host_client_config_t cfg = {
         .is_synchronous = false,
@@ -1434,9 +1535,13 @@ static void rndis_client_task(void *arg) {
 }
 
 // ─── ESP-netif USB ドライバ ────────────────────────────────────────────────────
+// esp-netif と USB Bulk OUT 転送を繋ぐドライバ層
+// lwIP が送信したいパケットは esp_netif_transmit 経由でここに来る
 
+// esp_netif が受信バッファを解放する際に呼ぶコールバック (deliver_rx_frame で malloc したメモリ)
 static void usb_driver_free_rx_buf(void *h, void *buf) { free(buf); }
 
+// lwIP から呼ばれる送信関数 – RNDIS または NCM ヘッダを付与して Bulk OUT 転送を投入する
 static esp_err_t usb_driver_transmit(void *h, void *buf, size_t len) {
     if (s_rndis_state != RNDIS_STATE_READY || !s_tx_xfer || !s_dev_hdl) {
         log_append("TX drop: state=%d tx=%p dev=%p", s_rndis_state, s_tx_xfer, s_dev_hdl);
@@ -1524,8 +1629,9 @@ static esp_err_t usb_driver_transmit(void *h, void *buf, size_t len) {
     return ESP_OK;
 }
 
-struct UsbDriver { esp_netif_driver_base_t base; };
+struct UsbDriver { esp_netif_driver_base_t base; }; // esp_netif ドライバ構造体 (base が先頭必須)
 
+// esp_netif_attach 後に呼ばれるコールバック – ドライバ関数ポインタを netif に登録する
 static esp_err_t usb_driver_post_attach(esp_netif_t *netif, void *args) {
     UsbDriver *drv = (UsbDriver *)args;
     drv->base.netif = netif;
@@ -1562,7 +1668,10 @@ static esp_netif_t *create_usb_netif(void) {
 }
 
 // ─── HTTP サーバー ────────────────────────────────────────────────────────────
+// ポート 80 で動作する管理 Web UI。デバイス状態とログを HTML で表示する。
+// s_http_rndis_only が true の場合は RNDIS サブネット (192.168.37.x) からのみアクセス可。
 
+// アクセス元 IP が USB LAN サブネットに属するか確認する
 static bool is_allowed_http_client(const IPAddress &remote_ip) {
     if (!s_http_rndis_only) return true;
 
@@ -1585,6 +1694,8 @@ static void send_http_forbidden(WiFiClient &client) {
     client.print(body);
 }
 
+// HTTP リクエストを処理してステータス/ログを HTML で返す
+// ページは 2 秒ごとに自動リフレッシュされる (meta refresh)
 static void handle_http_client(WiFiClient client) {
     IPAddress remote_ip = client.remoteIP();
     if (!is_allowed_http_client(remote_ip)) {
@@ -1656,8 +1767,8 @@ static void handle_http_client(WiFiClient client) {
 
 void setup() {
     auto m5cfg = M5.config();
-    M5.begin(m5cfg);
-    M5.Display.setRotation(1);
+    M5.begin(m5cfg);                    // M5Unified 初期化 (ディスプレイ・ボタン等)
+    M5.Display.setRotation(1);          // 横向き表示
     M5.Display.setTextSize(1);
     M5.Display.setTextColor(WHITE);
 
@@ -1730,35 +1841,32 @@ void setup() {
     }
 
     // 3. セマフォ・キュー初期化
-    s_ctrl_sem = xSemaphoreCreateBinary();
-    s_tx_sem   = xSemaphoreCreateBinary();
-    xSemaphoreGive(s_tx_sem);
-    s_dev_queue = xQueueCreate(2, sizeof(uint8_t));
+    s_ctrl_sem = xSemaphoreCreateBinary();         // コントロール転送完了待ち用
+    s_tx_sem   = xSemaphoreCreateBinary();         // TX 完了待ち用
+    xSemaphoreGive(s_tx_sem);                      // 初期状態は「送信可能」
+    s_dev_queue = xQueueCreate(2, sizeof(uint8_t)); // デバイスアドレス通知キュー (深さ2)
 
-    // 5. TX 転送バッファ（デバイス接続前に確保しておく）
-    usb_host_transfer_alloc(BULK_BUF_SIZE, 0, &s_tx_xfer);
+    // 4. TX 転送バッファ（デバイス接続前に確保しておく）
+    usb_host_transfer_alloc(BULK_BUF_SIZE, 0, &s_tx_xfer); // 送信バッファを事前確保
     s_tx_xfer->callback   = tx_callback;
     s_tx_xfer->context    = nullptr;
     s_tx_xfer->timeout_ms = 2000;
 
-    // 6. USB ホストライブラリ起動
+    // 5. USB ホストライブラリ起動
     const usb_host_config_t host_cfg = {
-        .skip_phy_setup      = false,
-        .root_port_unpowered = false,
-        .intr_flags          = ESP_INTR_FLAG_LEVEL1,
+        .skip_phy_setup      = false,         // USB PHY を初期化する
+        .root_port_unpowered = false,          // ルートポートに電源を供給する
+        .intr_flags          = ESP_INTR_FLAG_LEVEL1, // 割り込み優先度レベル 1
     };
     usb_host_install(&host_cfg);
 
-    // 7. タスク起動
-    // USB ホストデーモン (最高優先度, USB ハードウェアイベント処理)
-    xTaskCreate(usb_host_lib_task,  "usb_lib",   4096, nullptr,
-                configMAX_PRIORITIES - 1, nullptr);
-    // USB クライアント (デバイス接続/切断イベント)
-    xTaskCreate(rndis_client_task,  "usb_cli",   4096, nullptr,
-                configMAX_PRIORITIES - 2, nullptr);
-    // RNDIS ハンドシェイク (ブロッキング処理を安全に実行)
+    // 6. タスク起動 (優先度は USB 低レベル > クライアント > セットアップ の順)
+    xTaskCreate(usb_host_lib_task,  "usb_lib",    4096, nullptr,
+                configMAX_PRIORITIES - 1, nullptr); // USB ホストデーモン (最高優先度)
+    xTaskCreate(rndis_client_task,  "usb_cli",    4096, nullptr,
+                configMAX_PRIORITIES - 2, nullptr); // USB クライアント (接続/切断イベント)
     xTaskCreate(rndis_setup_task,   "rndis_stup", 8192, nullptr,
-                configMAX_PRIORITIES - 3, nullptr);
+                configMAX_PRIORITIES - 3, nullptr); // RNDIS ハンドシェイク (スタック大きめ)
 
     M5.Display.fillScreen(BLACK);
     M5.Display.setCursor(0, 0);
@@ -1770,13 +1878,13 @@ void setup() {
 }
 
 void loop() {
-    M5.update();
+    M5.update(); // ボタン状態を更新 (現在は使用していないが将来の拡張用)
 
-    // HTTP クライアント処理
+    // HTTP クライアントが接続していれば処理する (ブロッキングなし)
     WiFiClient client = server.available();
     if (client) {
-        handle_http_client(client);
+        handle_http_client(client); // ステータス・ログを HTML で返す
     }
 
-    delay(10);
+    delay(10); // CPU 独占を防ぐための短いウェイト
 }
